@@ -1,0 +1,19 @@
+{
+  "name": "cloudbake",
+  "owner": {
+    "name": "CloudBake",
+    "email": "hello@cloudbake.ai"
+  },
+  "metadata": {
+    "description": "CloudBake's plugin for Claude Code: render Blender scenes on cloud GPUs."
+  },
+  "plugins": [
+    {
+      "name": "cloudbake",
+      "source": "./",
+      "description": "Render Blender scenes on cloud GPUs with CloudBake: send a .blend from your project, and the frames come back into it.",
+      "category": "design",
+      "homepage": "https://cloudbake.ai/docs/quickstart"
+    }
+  ]
+}

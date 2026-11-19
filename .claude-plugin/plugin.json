@@ -1,0 +1,31 @@
+{
+  "name": "cloudbake",
+  "version": "0.1.0",
+  "description": "Render Blender scenes on cloud GPUs with CloudBake from Claude Code: send a .blend from your project, and the frames come back into it. Converts to .glb, .fbx and .usdz too.",
+  "author": {
+    "name": "CloudBake",
+    "email": "hello@cloudbake.ai",
+    "url": "https://cloudbake.ai"
+  },
+  "homepage": "https://cloudbake.ai/docs/quickstart",
+  "repository": "https://github.com/Darkmatter-AI/cloudbake-claude-plugin",
+  "license": "MIT",
+  "keywords": [
+    "blender",
+    "render",
+    "gpu",
+    "cycles",
+    "3d",
+    "glb",
+    "usdz"
+  ],
+  "userConfig": {
+    "api_key": {
+      "type": "string",
+      "title": "CloudBake API key",
+      "description": "Make one at https://cloudbake.ai/app/connections and paste it here (cb_live_…). It is kept in your system's credential store, not in a settings file. Leave it empty to use CLOUDBAKE_API_KEY from your shell instead.",
+      "sensitive": true,
+      "required": false
+    }
+  }
+}

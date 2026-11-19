@@ -1,0 +1,459 @@
+#!/usr/bin/env node
+// CloudBake's MCP server for Claude Code. It renders a .blend from this computer on CloudBake's
+// cloud GPUs and saves what the job made back into the project folder.
+//
+// It speaks MCP over stdio (one JSON-RPC 2.0 message a line) and calls the public API, the same one
+// https://cloudbake.ai/docs/api describes, with the user's API key. A file goes from the disk straight to
+// storage through the upload's link, and frames come back the same way: the API never carries a file.
+//
+// Plain Node (20 or later), no packages, so a plugin install needs nothing but this file.
+//
+// Settings, from the environment:
+//   CLOUDBAKE_PLUGIN_KEY   the key the plugin asked for at install (.mcp.json passes ${user_config.api_key})
+//   CLOUDBAKE_API_KEY      used when the plugin has none: the quickstart's variable
+//   CLOUDBAKE_PROJECT_DIR  what relative paths are relative to (.mcp.json passes ${CLAUDE_PROJECT_DIR})
+//   CLOUDBAKE_URL          the API's address, https://cloudbake.ai unless set (for tests)
+//   CLOUDBAKE_POLL_MS, CLOUDBAKE_WAIT_SECONDS   how often, and how long at most, `status` asks while it waits
+
+import { createReadStream, createWriteStream } from 'node:fs';
+import { mkdir, open, rename, rm, stat } from 'node:fs/promises';
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
+import { randomUUID } from 'node:crypto';
+import { basename, extname, isAbsolute, join, resolve } from 'node:path';
+import { createInterface } from 'node:readline';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+
+const VERSION = '0.1.0';
+// MCP versions this server speaks, newest first. Nothing it uses changed between them.
+const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
+const MAX_FILE = 4 * 1024 ** 3; // the API's limit: 4 GiB
+const ENDED = new Set(['done', 'failed', 'cancelled']);
+const JOB_ID = /^rq_[0-9a-f]{8,32}$/;
+const UPLOAD_ID = /^up_[0-9a-f]{16}$/;
+const KEY = /^cb_live_[0-9a-f]{40}$/;
+const CONNECTIONS = 'https://cloudbake.ai/app/connections';
+
+// A value .mcp.json passes through, unless Claude Code left the placeholder in (no value was set).
+function setting(name) {
+  const value = (process.env[name] ?? '').trim();
+  return value && !value.includes('${') ? value : '';
+}
+
+const config = {
+  key: setting('CLOUDBAKE_PLUGIN_KEY') || setting('CLOUDBAKE_API_KEY'),
+  origin: (setting('CLOUDBAKE_URL') || 'https://cloudbake.ai').replace(/\/+$/, ''),
+  projectDir: setting('CLOUDBAKE_PROJECT_DIR') || process.cwd(),
+  pollMs: Number(setting('CLOUDBAKE_POLL_MS')) || 4000,
+  waitMs: (Number(setting('CLOUDBAKE_WAIT_SECONDS')) || 300) * 1000,
+};
+
+// A mistake the person or Claude can fix: said as is, as a tool error.
+class Refusal extends Error {}
+
+const sleep = (ms, signal) =>
+  new Promise((done, fail) => {
+    if (signal?.aborted) return fail(signal.reason);
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener('abort', () => (clearTimeout(timer), fail(signal.reason)), { once: true });
+  });
+
+const pathOf = (path) => resolve(isAbsolute(path) ? path : join(config.projectDir, path));
+
+// ---------------------------------------------------------------------------------------------------------
+// The API
+
+// One call to /v1. A GET, a POST that carries an Idempotency-Key, or one that is safe twice (`retry`) is
+// tried again when the network fails, the service is briefly away, or the rate limit says to wait: none of
+// those can start a second job.
+async function api(method, path, { body, idempotencyKey, retry = false, signal, withStatus = false } = {}) {
+  if (!config.key) {
+    throw new Refusal(
+      `No CloudBake API key is set. Make one at ${CONNECTIONS}, then give it to the plugin with /plugin configure cloudbake@cloudbake in Claude Code, and restart Claude Code (or set CLOUDBAKE_API_KEY in the shell that starts it). Never paste the key into the chat.`,
+    );
+  }
+  if (!KEY.test(config.key)) {
+    throw new Refusal(`The CloudBake API key set for the plugin does not look like one (cb_live_ and 40 hex digits). Make a new one at ${CONNECTIONS} and set it again.`);
+  }
+  const headers = { authorization: `Bearer ${config.key}`, accept: 'application/json', 'user-agent': `cloudbake-claude-plugin/${VERSION}` };
+  if (body !== undefined) headers['content-type'] = 'application/json';
+  if (idempotencyKey) headers['idempotency-key'] = idempotencyKey;
+  const again = method === 'GET' || Boolean(idempotencyKey) || retry;
+
+  for (let attempt = 1; ; attempt += 1) {
+    const last = !again || attempt >= 3;
+    let answer;
+    try {
+      answer = await fetch(config.origin + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal });
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      if (last) throw new Refusal(`Could not reach ${config.origin} (${error.cause?.code ?? error.message}). Check the connection and try again.`);
+      await sleep(1000 * attempt, signal);
+      continue;
+    }
+    if (!last && (answer.status === 429 || answer.status === 502 || answer.status === 503 || answer.status === 504)) {
+      const wait = Math.min(Number(answer.headers.get('retry-after')) || attempt * 2, 30);
+      await answer.body?.cancel();
+      await sleep(wait * 1000, signal);
+      continue;
+    }
+    const text = await answer.text();
+    let data = null;
+    try {
+      data = JSON.parse(text);
+    } catch {}
+    if (answer.ok) return withStatus ? { status: answer.status, data } : data;
+    const code = data?.error?.code ?? `http_${answer.status}`;
+    const message = data?.error?.message ?? `CloudBake answered ${answer.status}.`;
+    throw new Refusal(`${message} (${code})`);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Files
+
+// The first bytes of a .blend: "BLENDER", or the zstd or gzip header of a compressed one.
+async function looksLikeBlend(path) {
+  const file = await open(path, 'r');
+  try {
+    const { buffer, bytesRead } = await file.read(Buffer.alloc(7), 0, 7, 0);
+    const head = buffer.subarray(0, bytesRead);
+    return head.toString('latin1') === 'BLENDER' || head.subarray(0, 4).equals(Buffer.from([0x28, 0xb5, 0x2f, 0xfd])) || head.subarray(0, 2).equals(Buffer.from([0x1f, 0x8b]));
+  } finally {
+    await file.close();
+  }
+}
+
+async function checkBlend(path) {
+  const full = pathOf(path);
+  let info;
+  try {
+    info = await stat(full);
+  } catch {
+    throw new Refusal(`There is no file at ${full}.`);
+  }
+  if (!info.isFile()) throw new Refusal(`${full} is a folder, not a .blend file.`);
+  if (info.size === 0) throw new Refusal(`${full} is empty.`);
+  if (info.size > MAX_FILE) throw new Refusal(`${full} is ${(info.size / 1024 ** 3).toFixed(1)} GiB; CloudBake takes 4 GiB at most.`);
+  if (!(await looksLikeBlend(full))) throw new Refusal(`${full} is not a .blend file: it does not start the way Blender saves one.`);
+  return { full, bytes: info.size };
+}
+
+// PUT a file to an upload link with its length (storage refuses a PUT without one), telling progress.
+function putFile(url, path, bytes, { signal, progress }) {
+  return new Promise((done, fail) => {
+    const target = new URL(url);
+    const send = target.protocol === 'https:' ? httpsRequest : httpRequest;
+    const request = send(target, { method: 'PUT', headers: { 'content-length': bytes }, signal }, (answer) => {
+      let text = '';
+      answer.setEncoding('utf8');
+      answer.on('data', (chunk) => (text += chunk));
+      answer.on('end', () => {
+        if (answer.statusCode >= 200 && answer.statusCode < 300) done();
+        else fail(new Refusal(`Storage did not take the file (${answer.statusCode}${text ? `: ${text.slice(0, 200)}` : ''}). Try again.`));
+      });
+    });
+    request.on('error', (error) => fail(signal?.aborted ? error : new Refusal(`The upload broke off (${error.code ?? error.message}). Try again.`)));
+    const file = createReadStream(path);
+    let sent = 0;
+    let told = 0;
+    file.on('data', (chunk) => {
+      sent += chunk.length;
+      if (Date.now() - told > 1000) {
+        told = Date.now();
+        progress(sent, bytes, `Uploading ${basename(path)}: ${Math.round((sent / bytes) * 100)}%`);
+      }
+    });
+    file.on('error', (error) => (request.destroy(), fail(error)));
+    file.pipe(request);
+  });
+}
+
+async function upload(path, context) {
+  const { full, bytes } = await checkBlend(path);
+  const made = await api('POST', '/v1/uploads', { body: { name: basename(full).slice(0, 200), bytes }, signal: context.signal });
+  await putFile(made.upload_url, full, bytes, context);
+  return made.id;
+}
+
+// Save one link's file at `to`, through a temporary name, so a broken download leaves no half file.
+async function saveFile(url, to, signal) {
+  const answer = await fetch(url, { signal });
+  if (!answer.ok || !answer.body) throw new Refusal(`Could not download ${basename(to)} (${answer.status}). The links last an hour: try download again.`);
+  const part = `${to}.part-${process.pid}`;
+  try {
+    await pipeline(Readable.fromWeb(answer.body), createWriteStream(part));
+    await rename(part, to);
+  } catch (error) {
+    await rm(part, { force: true });
+    throw error;
+  }
+  return (await stat(to)).size;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// What a job says, in a sentence
+
+function frames(job) {
+  return job.kind === 'convert' ? `to ${(job.formats ?? []).join(', ')}` : `${job.frames.done} of ${job.frames.total} frames`;
+}
+
+function sayJob(job, { waited = false } = {}) {
+  const what = `${job.id} (${job.kind} of ${job.scene})`;
+  if (job.status === 'done') return `${what} is done: ${job.kind === 'convert' ? `converted ${frames(job)}` : `${frames(job)}`}. Call download to save the files.`;
+  if (job.status === 'cancelled') return `${what} was cancelled: ${frames(job)} were made. download saves them.`;
+  if (job.status === 'failed') {
+    const fix = job.error?.you_can_fix_it === false ? 'The fault was on CloudBake\'s side, so it is not charged: start it again.' : 'Change the scene or the request, then start a new job.';
+    const kept = job.kind === 'render' && job.frames.done > 0 ? ` ${frames(job)} were kept: download saves them.` : '';
+    return `${what} failed: ${job.error?.message ?? 'no reason given.'} ${fix}${kept}`;
+  }
+  const still = waited ? ` Still ${job.status} after ${Math.round(config.waitMs / 60000)} minutes: call status with wait again.` : ' Call status with wait to follow it.';
+  return `${what} is ${job.status}: ${frames(job)}.${still}`;
+}
+
+const result = (text, data) => ({ content: [{ type: 'text', text: data === undefined ? text : `${text}\n\n${JSON.stringify(data, null, 2)}` }] });
+
+// ---------------------------------------------------------------------------------------------------------
+// The tools
+
+const sceneFields = {
+  file: { type: 'string', description: 'A .blend on this computer: a path, absolute or relative to the project folder. It is uploaded (4 GiB at most), and kept 14 days for more jobs.' },
+  upload: { type: 'string', pattern: UPLOAD_ID.source, description: 'An upload id (up_…) an earlier render or convert answered: the same file again, without sending it again.' },
+};
+
+const tools = [
+  {
+    name: 'render',
+    title: 'Render a Blender scene',
+    description:
+      'Render frames of a .blend on CloudBake\'s cloud GPUs. Give exactly one of `file`, `upload` or `sample`. The file is uploaded first, then the job starts and this answers at once with the job: follow it with status (wait: true), then save the frames with download. GPU time is charged to the CloudBake credit; the scene is checked on a CPU first, free, and a scene that cannot render fails there.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        ...sceneFields,
+        sample: { type: 'boolean', description: 'Render the sample scene CloudBake hosts instead (240 frames, 24 a job at most; frames 1-4 when none are named), to try it without a file.' },
+        frames: { type: ['string', 'integer'], description: 'Which frames: a number ("1"), a range ("1-24") or a list ("1,5,9-12"). Needed for a file or an upload; 2,000 a job at most.' },
+        samples: { type: 'integer', minimum: 1, maximum: 16384, description: 'Samples per pixel, instead of the scene\'s own.' },
+        width: { type: 'integer', minimum: 1, maximum: 8192, description: 'Pixels across, instead of the scene\'s own.' },
+        height: { type: 'integer', minimum: 1, maximum: 8192, description: 'Pixels down, instead of the scene\'s own. Width times height is 7680 x 4320 at most.' },
+        engine: { type: 'string', enum: ['cycles', 'eevee', 'workbench'], description: 'The render engine, instead of the scene\'s own.' },
+      },
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    run: render,
+  },
+  {
+    name: 'convert',
+    title: 'Convert a Blender scene',
+    description: 'Convert a .blend to .glb, .fbx or .usdz on CloudBake. Runs on a CPU and is not charged. Give exactly one of `file` or `upload`. Answers at once with the job: follow it with status (wait: true), then save the files with download.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['formats'],
+      properties: {
+        ...sceneFields,
+        formats: { type: 'array', minItems: 1, items: { type: 'string', enum: ['glb', 'fbx', 'usdz'] }, description: 'What to convert to.' },
+        draco: { type: 'boolean', description: 'Compress the meshes of the .glb (Draco).' },
+      },
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    run: convert,
+  },
+  {
+    name: 'status',
+    title: 'How a CloudBake job is going',
+    description: `A job's status and frames done. With wait: true it waits, telling progress, until the job ends (done, failed or cancelled) or ${Math.round(config.waitMs / 60000)} minutes pass; call it again to keep waiting.`,
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['job'],
+      properties: { job: { type: 'string', pattern: JOB_ID.source, description: 'The job id, rq_…' }, wait: { type: 'boolean', description: 'Wait for the job to end.' } },
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+    run: status,
+  },
+  {
+    name: 'download',
+    title: 'Save what a CloudBake job made',
+    description:
+      'Save the files of a job that has ended into a folder: one PNG a frame for a render (or frames.zip with zip: true), the converted files for a convert. A failed or cancelled render keeps the frames it made. Files of the same name are replaced. Files are kept 14 days on CloudBake.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['job'],
+      properties: {
+        job: { type: 'string', pattern: JOB_ID.source, description: 'The job id, rq_…' },
+        folder: { type: 'string', description: 'Where to save: a path, absolute or relative to the project folder; made if missing. Default: renders/<job id>.' },
+        zip: { type: 'boolean', description: 'Render: save frames.zip, with every frame, instead of one file a frame.' },
+      },
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    run: download,
+  },
+  {
+    name: 'cancel',
+    title: 'Cancel a CloudBake job',
+    description: 'Stop a job. Frames already made are kept, and only the GPU time used is charged.',
+    inputSchema: { type: 'object', additionalProperties: false, required: ['job'], properties: { job: { type: 'string', pattern: JOB_ID.source, description: 'The job id, rq_…' } } },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    run: cancel,
+  },
+  {
+    name: 'whoami',
+    title: 'Check the CloudBake key',
+    description: 'Which CloudBake account and key the plugin uses: the first thing to call when something says the key does not work.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: {} },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+    run: whoami,
+  },
+];
+
+// The scene of a job: an upload of this computer's file, an earlier upload, or the sample.
+async function sceneOf(args, context, { sampleAllowed }) {
+  const given = ['file', 'upload', ...(sampleAllowed ? ['sample'] : [])].filter((name) => args[name] !== undefined && args[name] !== false && args[name] !== '');
+  if (given.length !== 1) throw new Refusal(`Give exactly one of ${sampleAllowed ? '`file`, `upload` or `sample`' : '`file` or `upload`'}.`);
+  if (args.sample) return { scene: 'sample' };
+  if (args.upload) {
+    if (!UPLOAD_ID.test(args.upload)) throw new Refusal('`upload` is an upload id like up_0123456789abcdef.');
+    return { upload: args.upload };
+  }
+  return { upload: await upload(args.file, context) };
+}
+
+async function render(args, context) {
+  // Checked before the file is sent.
+  if (!args.sample && args.frames === undefined) throw new Refusal('Say which frames to render: "1", "1-24" or "1,5,9-12".');
+  const body = await sceneOf(args, context, { sampleAllowed: true });
+  for (const name of ['frames', 'samples', 'width', 'height', 'engine']) if (args[name] !== undefined) body[name] = args[name];
+  const job = await api('POST', '/v1/jobs', { body, idempotencyKey: randomUUID(), signal: context.signal });
+  return result(`Started ${job.id}: ${job.frames.total} frame${job.frames.total === 1 ? '' : 's'} of ${job.scene}${body.upload ? ` (upload ${body.upload}; pass it as \`upload\` to use the same file again)` : ''}. Follow it with status (wait: true).`, job);
+}
+
+async function convert(args, context) {
+  const body = { ...(await sceneOf(args, context, { sampleAllowed: false })), kind: 'convert', formats: args.formats };
+  if (args.draco !== undefined) body.draco = args.draco;
+  const job = await api('POST', '/v1/jobs', { body, idempotencyKey: randomUUID(), signal: context.signal });
+  return result(`Started ${job.id}: converting ${job.scene} to ${(job.formats ?? args.formats).join(', ')} (upload ${body.upload}). Follow it with status (wait: true).`, job);
+}
+
+async function status({ job: id, wait = false }, context) {
+  if (!JOB_ID.test(id ?? '')) throw new Refusal('`job` is a job id like rq_0123456789abcdef.');
+  let job = await api('GET', `/v1/jobs/${id}`, { signal: context.signal });
+  if (wait) {
+    const until = Date.now() + config.waitMs;
+    while (!ENDED.has(job.status) && Date.now() < until) {
+      context.progress(job.frames.done, job.frames.total || undefined, `${job.status}: ${frames(job)}`);
+      await sleep(config.pollMs, context.signal);
+      job = await api('GET', `/v1/jobs/${id}`, { signal: context.signal });
+    }
+  }
+  return result(sayJob(job, { waited: wait }), job);
+}
+
+async function download({ job: id, folder, zip = false }, context) {
+  if (!JOB_ID.test(id ?? '')) throw new Refusal('`job` is a job id like rq_0123456789abcdef.');
+  const answer = await api('GET', `/v1/jobs/${id}/files`, { signal: context.signal });
+  if (!ENDED.has(answer.job.status)) return result(`${id} has not ended yet (${answer.job.status}, ${frames(answer.job)}): its files are listed once it has. Call status with wait first.`);
+  let files = answer.files;
+  if (answer.job.kind === 'render') files = files.filter((file) => (file.name === 'frames.zip') === zip);
+  if (files.length === 0) return result(`${id} ended (${answer.job.status}) with no files to save.`);
+  const into = pathOf(folder || join('renders', id));
+  await mkdir(into, { recursive: true });
+  const saved = [];
+  for (const [index, file] of files.entries()) {
+    const name = basename(file.name);
+    if (!name || name === '.' || name === '..') continue;
+    context.progress(index, files.length, `Downloading ${name}`);
+    const to = join(into, name);
+    saved.push({ path: to, frame: file.frame, bytes: await saveFile(file.url, to, context.signal) });
+  }
+  const list = saved.map((file) => `- ${file.path}`).join('\n');
+  return result(`Saved ${saved.length} file${saved.length === 1 ? '' : 's'} of ${id} (${answer.job.status}) in ${into}:\n${list}`);
+}
+
+async function cancel({ job: id }, context) {
+  if (!JOB_ID.test(id ?? '')) throw new Refusal('`job` is a job id like rq_0123456789abcdef.');
+  // 202: the cancel was asked for. 200: the job had ended already.
+  const { status: asked, data: job } = await api('POST', `/v1/jobs/${id}/cancel`, { retry: true, signal: context.signal, withStatus: true });
+  return result(asked === 200 ? `${id} had ended already (${job.status}): nothing changed.` : `Asked CloudBake to cancel ${id}. Frames already made are kept; status says cancelled once no frame of it is on a GPU.`, job);
+}
+
+async function whoami(_args, context) {
+  const me = await api('GET', '/v1/me', { signal: context.signal });
+  return result(`The plugin uses the key "${me.key.name}" (ending ${me.key.last_four}) of ${me.email}'s CloudBake account at ${config.origin}.`);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// MCP over stdio
+
+const INSTRUCTIONS = [
+  'CloudBake renders Blender scenes on cloud GPUs and converts them to .glb, .fbx or .usdz.',
+  'A render: render (file and frames) answers at once with a job id; status with wait: true follows it until it ends; download saves the frames into the project.',
+  'GPU time is charged to the person\'s CloudBake credit: before rendering more than a few frames, render one test frame, show it, and say how many frames the full job is.',
+].join(' ');
+
+const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
+const running = new Map(); // request id → AbortController, for notifications/cancelled
+
+async function call(params, id) {
+  const tool = tools.find((candidate) => candidate.name === params?.name);
+  if (!tool) return { error: { code: -32602, message: `Unknown tool: ${params?.name}` } };
+  const controller = new AbortController();
+  running.set(id, controller);
+  const token = params._meta?.progressToken;
+  const context = {
+    signal: controller.signal,
+    progress: (progress, total, message) => {
+      if (token !== undefined) write({ jsonrpc: '2.0', method: 'notifications/progress', params: { progressToken: token, progress, ...(total ? { total } : {}), message } });
+    },
+  };
+  try {
+    return { result: await tool.run(params.arguments ?? {}, context) };
+  } catch (error) {
+    if (controller.signal.aborted) return null;
+    const text = error instanceof Refusal ? error.message : `Something went wrong in the CloudBake plugin: ${error.message}`;
+    if (!(error instanceof Refusal)) console.error(error);
+    return { result: { content: [{ type: 'text', text }], isError: true } };
+  } finally {
+    running.delete(id);
+  }
+}
+
+async function handle(message) {
+  const { id, method, params } = message;
+  if (id === undefined) {
+    if (method === 'notifications/cancelled') running.get(params?.requestId)?.abort('cancelled');
+    return;
+  }
+  let answer;
+  if (method === 'initialize') {
+    const asked = params?.protocolVersion;
+    answer = {
+      result: {
+        protocolVersion: PROTOCOLS.includes(asked) ? asked : PROTOCOLS[0],
+        capabilities: { tools: { listChanged: false } },
+        serverInfo: { name: 'cloudbake', title: 'CloudBake', version: VERSION },
+        instructions: INSTRUCTIONS,
+      },
+    };
+  } else if (method === 'ping') answer = { result: {} };
+  else if (method === 'tools/list') answer = { result: { tools: tools.map(({ run, ...tool }) => tool) } };
+  else if (method === 'tools/call') answer = await call(params, id);
+  else answer = { error: { code: -32601, message: `Method not found: ${method}` } };
+  if (answer) write({ jsonrpc: '2.0', id, ...answer });
+}
+
+createInterface({ input: process.stdin }).on('line', (line) => {
+  if (!line.trim()) return;
+  let message;
+  try {
+    message = JSON.parse(line);
+  } catch {
+    write({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
+    return;
+  }
+  handle(message).catch((error) => console.error(error));
+});
+process.stdin.on('end', () => process.exit(0));
