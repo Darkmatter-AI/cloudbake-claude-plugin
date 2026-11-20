@@ -79,7 +79,11 @@ sentence that says what to change, and costs nothing.
 ### What it costs
 
 GPU time is paid from your CloudBake credit. A small test frame costs about a cent; big frames with many
-samples cost more. A convert runs on a CPU and is free.
+samples cost more. A convert runs on a CPU and is free. When a job ends, `status` says what it cost, so after a
+test frame Claude can say what the whole job would cost.
+
+An account runs 3 jobs at once, and a job beyond that is refused, not queued. Claude puts the frames of an
+animation in one job (up to 2,000 frames) rather than starting many.
 
 ## Update or remove
 
@@ -93,10 +97,10 @@ samples cost more. A convert runs on a CPU and is free.
 | --- | --- |
 | `render` | Uploads a .blend (or reuses an upload, or the hosted sample) and starts a render of the frames you name. |
 | `convert` | The same for a convert to .glb, .fbx or .usdz. |
-| `status` | How a job is going. With `wait`, it waits until the job ends, up to 5 minutes a call. |
+| `status` | How a job is going. With `wait`, it waits until the job ends, up to 5 minutes a call. A job that has ended says what it cost. |
 | `download` | Saves what a job made into a folder: one PNG a frame, frames.zip, or the converted files. |
 | `cancel` | Stops a job. Frames already made are kept. |
-| `whoami` | Which account and key the plugin uses. |
+| `whoami` | Which account and key the plugin uses, its balance, the jobs running now, and the limits. |
 | `video` | Makes an MP4 of a finished render's frames (all, or `frames` / `leave_out`), free in the beta, and saves it into `renders/<job id>/`. |
 
 The plugin calls the same API as the [quickstart](https://cloudbake.ai/docs/quickstart) and the
@@ -114,7 +118,7 @@ back.
 | `skills/render/SKILL.md` | How Claude renders with it: check the scene, one test frame first, follow, download, an MP4. |
 | `test/` | Tests of the server against a fake API (`fake-api.mjs`). |
 
-- **Test:** `node --test test/` (Node 22 or later, for the fake API's PNG). Nothing is sent to CloudBake.
+- **Test:** `node --test test/*.mjs` (Node 22 or later, for the fake API's PNG). Nothing is sent to CloudBake.
 - **Check the manifests:** `claude plugin validate .`
 - **Try it in Claude Code without spending:** `node test/fake-api.mjs --serve` prints the variables to start
   Claude Code with. Then `claude --plugin-dir /path/to/this/repo` in a folder with a .blend. A `--plugin-dir`
