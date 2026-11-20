@@ -7,7 +7,7 @@ import { mkdtemp, readFile, readdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
-import { FAKE_KEY, PNG, startFakeApi } from './fake-api.mjs';
+import { FAKE_KEY, MP4, PNG, startFakeApi } from './fake-api.mjs';
 
 const SERVER = new URL('../server/cloudbake-mcp.mjs', import.meta.url).pathname;
 const BLEND = Buffer.concat([Buffer.from('BLENDER-v405REND'), Buffer.alloc(4096, 7)]);
@@ -74,18 +74,19 @@ function connect(env = {}) {
 
 const jobOf = (text) => JSON.parse(text.slice(text.indexOf('\n\n') + 2));
 
-test('initialize answers the protocol the client asked for, and lists six tools with schemas', async () => {
+test('initialize answers the protocol the client asked for, and lists seven tools with schemas', async () => {
   const mcp = connect();
   const init = await mcp.ask('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } });
   assert.equal(init.result.protocolVersion, '2025-06-18');
   assert.deepEqual(init.result.capabilities, { tools: { listChanged: false } });
   assert.equal(init.result.serverInfo.name, 'cloudbake');
   assert.match(init.result.instructions, /one test frame/);
+  assert.match(init.result.instructions, /video \(wait: true\) makes an MP4 of them, free/);
   const newer = await mcp.ask('initialize', { protocolVersion: '2099-01-01', capabilities: {}, clientInfo: { name: 'test', version: '1' } });
   assert.equal(newer.result.protocolVersion, '2025-11-25');
   mcp.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
   const list = await mcp.ask('tools/list', {});
-  assert.deepEqual(list.result.tools.map((tool) => tool.name), ['render', 'convert', 'status', 'download', 'cancel', 'whoami']);
+  assert.deepEqual(list.result.tools.map((tool) => tool.name), ['render', 'convert', 'status', 'download', 'cancel', 'whoami', 'video']);
   for (const tool of list.result.tools) {
     assert.equal(tool.inputSchema.type, 'object');
     assert.ok(tool.description && tool.title && tool.annotations, tool.name);
@@ -265,5 +266,109 @@ test('the key: the plugin\'s comes first, the shell\'s is used when the plugin h
   answer = await mcp.tool('whoami');
   assert.match(answer.text, /This API key does not work.*\(api_key_invalid\)/);
   assert.ok(!mcp.output().includes('a'.repeat(40)));
+  await mcp.close();
+});
+
+// A render of the sample's frames 1-8, followed to done: what an MP4 is made of.
+async function finishedRender(mcp) {
+  const job = jobOf((await mcp.tool('render', { sample: true, frames: '1-8' })).text);
+  assert.match((await mcp.tool('status', { job: job.id, wait: true })).text, /is done: 8 of 8 frames/);
+  return job;
+}
+const videoOf = (text) => JSON.parse(text.slice(text.indexOf('\n\n') + 2));
+
+test('video makes an MP4 of a finished render, waits for it, and saves it into renders/<job id>', async () => {
+  const mcp = connect();
+  const going = jobOf((await mcp.tool('render', { sample: true, frames: '1-8' })).text);
+  const early = await mcp.tool('video', { job: going.id });
+  assert.equal(early.isError, true);
+  assert.match(early.text, /An MP4 is made of a finished render with at least 2 frames\. \(no_video\)/);
+
+  const job = await finishedRender(mcp);
+  const answer = await mcp.tool('video', { job: job.id, leave_out: '3-4', wait: true }, { progressToken: 'v1' });
+  assert.equal(answer.isError, undefined, answer.text);
+  const made = videoOf(answer.text);
+  assert.match(made.id, /^vid_[0-9a-f]{16}$/);
+  const file = join(project, 'renders', job.id, `${made.id}.mp4`);
+  assert.equal(
+    answer.text.split('\n\n')[0],
+    `${made.id} (an MP4 of ${job.id}) is ready: 6 frames (1-2, 5-8) at 24 FPS, 0.25 s, 2x2, 1 KB. Saved it as ${file}. CloudBake keeps the MP4 14 days: call video with video: "${made.id}" to save it again.`,
+  );
+  assert.deepEqual(made.frames, { total: 6, done: 6, list: '1-2, 5-8' });
+  assert.equal(made.file, file);
+  assert.deepEqual(await readFile(file), MP4);
+  assert.deepEqual(fake.state.calls.findLast((call) => call.method === 'POST' && call.path.endsWith('/videos')).body, { leave_out: '3-4' });
+  assert.ok(mcp.notes.some((note) => note.method === 'notifications/progress' && note.params.progressToken === 'v1' && /gathering|encoding/.test(note.params.message)), 'progress was told');
+  await mcp.close();
+});
+
+test('video: a refusal of the API says its code and its field; its own refusals send nothing', async () => {
+  const mcp = connect();
+  const job = await finishedRender(mcp);
+  const outside = await mcp.tool('video', { job: job.id, frames: '7-12' });
+  assert.equal(outside.isError, true);
+  assert.equal(outside.text, 'Frames 9-12 are not in this render. It has frames 1-8. (bad_frames, in `frames`)');
+  const cut = await mcp.tool('video', { job: job.id, leave_out: 'twenty' });
+  assert.match(cut.text, /is not a frame number .*\(bad_frames, in `leave_out`\)/);
+  const fast = await mcp.tool('video', { job: job.id, fps: 500 });
+  assert.match(fast.text, /from 1 to 120.*\(bad_fps, in `fps`\)/);
+
+  const calls = fake.state.calls.length;
+  const cases = [
+    [{ job: 'nope' }, /`job` is a job id like/],
+    [{ job: job.id, video: 'vid_nope' }, /`video` is an MP4 id like/],
+    [{ job: job.id, video: 'vid_0123456789abcdef', frames: '1-2' }, /not both/],
+  ];
+  for (const [args, said] of cases) {
+    const answer = await mcp.tool('video', args);
+    assert.equal(answer.isError, true, JSON.stringify(args));
+    assert.match(answer.text, said);
+  }
+  assert.equal(fake.state.calls.length, calls);
+  await mcp.close();
+});
+
+test('video: following one already started, and a second start points at it', async () => {
+  const mcp = connect();
+  const job = await finishedRender(mcp);
+  fake.state.holdVideos = true; // queued until let go
+  const started = await mcp.tool('video', { job: job.id, fps: 12 });
+  const made = videoOf(started.text);
+  assert.equal(made.status, 'queued');
+  assert.equal(started.text.split('\n\n')[0], `${made.id} (an MP4 of ${job.id}) is starting: 0 of 8 frames. Call video with video: "${made.id}" and wait: true to follow it.`);
+  assert.deepEqual(fake.state.calls.findLast((call) => call.method === 'POST' && call.path.endsWith('/videos')).body, { fps: 12 });
+
+  const again = await mcp.tool('video', { job: job.id });
+  assert.equal(again.isError, true);
+  assert.equal(again.text, `An MP4 of this render is being made. Make the next one when it is ready. It is ${made.id}: call video with video: "${made.id}" and wait: true to follow it. (video_running)`);
+
+  // Another server (a new session) did not start it: it points at the card instead.
+  const other = connect();
+  const elsewhere = await other.tool('video', { job: job.id });
+  assert.match(elsewhere.text, /being made\. .*Its card on http:\/\/127\.0\.0\.1:\d+\/app\/requests shows how it goes\. \(video_running\)$/);
+  await other.close();
+
+  // A wait shorter than the export: it says to call again.
+  const hurried = connect({ CLOUDBAKE_WAIT_SECONDS: '0.05', CLOUDBAKE_POLL_MS: '100' });
+  const short = await hurried.tool('video', { job: job.id, video: made.id, wait: true });
+  await hurried.close();
+  assert.match(short.text, new RegExp(`is starting: 0 of 8 frames\\. Still not ready after .*: call video with video: "${made.id}" and wait: true again\\.`));
+  fake.state.holdVideos = false;
+
+  const mcp2 = connect();
+  const followed = await mcp2.tool('video', { job: job.id, video: made.id, wait: true, folder: 'clips' });
+  assert.equal(followed.isError, undefined, followed.text);
+  assert.match(followed.text, /is ready: 8 frames \(1-8\) at 12 FPS, 0\.67 s, 2x2/);
+  assert.deepEqual(await readFile(join(project, 'clips', `${made.id}.mp4`)), MP4);
+  assert.ok(!fake.state.calls.slice(-3).some((call) => call.method === 'POST'), 'following starts nothing');
+
+  // Done, it is no longer running: a new one of the same render starts.
+  const next = await mcp2.tool('video', { job: job.id });
+  assert.equal(next.isError, undefined, next.text);
+  assert.notEqual(videoOf(next.text).id, made.id);
+
+  const unknown = await mcp2.tool('video', { job: job.id, video: 'vid_0123456789abcdef' });
+  assert.match(unknown.text, /This job has no MP4 with this id.*\(video_not_found\)/);
+  await mcp2.close();
   await mcp.close();
 });

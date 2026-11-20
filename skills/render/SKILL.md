@@ -40,6 +40,7 @@ The scene's own resolution, samples and engine are used unless `width`, `height`
 1. `render` answers at once with the job (`rq_…`) and the upload (`up_…`).
 2. `status` with `wait: true` waits until the job ends, up to 5 minutes a call. Call it again while it is still rendering. A first frame takes about a minute, because a GPU has to start.
 3. `download` saves the files into `renders/<job id>/` in the project, or into `folder` if the person named one. A render saves one PNG a frame (`frame_00001.png` …), or frames.zip with `zip: true`. Tell the person where the files are.
+4. A finished render can become an MP4 with `video` (`wait: true`; `leave_out` cuts frames, like `25-30`). It is made from the frames already rendered, free in the beta, and saved as `renders/<job id>/<vid>.mp4`.
 
 To render more frames of the same file, or convert it, pass `upload` instead of `file`: it is not sent again. An upload is kept for 14 days.
 
