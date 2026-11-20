@@ -25,7 +25,7 @@ import { createInterface } from 'node:readline';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 // MCP versions this server speaks, newest first. Nothing it uses changed between them.
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 const MAX_FILE = 4 * 1024 ** 3; // the API's limit: 4 GiB
@@ -34,6 +34,9 @@ const JOB_ID = /^rq_[0-9a-f]{8,32}$/;
 const UPLOAD_ID = /^up_[0-9a-f]{16}$/;
 const KEY = /^cb_live_[0-9a-f]{40}$/;
 const CONNECTIONS = 'https://cloudbake.ai/app/connections';
+// The limits as the tools' descriptions say them. whoami reads the account's own from GET /v1/me.
+const AT_ONCE = 3;
+const FRAMES_A_JOB = '2,000';
 
 // A value .mcp.json passes through, unless Claude Code left the placeholder in (no value was set).
 function setting(name) {
@@ -49,8 +52,14 @@ const config = {
   waitMs: (Number(setting('CLOUDBAKE_WAIT_SECONDS')) || 300) * 1000,
 };
 
-// A mistake the person or Claude can fix: said as is, as a tool error.
-class Refusal extends Error {}
+// A mistake the person or Claude can fix: said as is, as a tool error. `details` is the API's error, with the
+// fields it adds (too_many_jobs: `running` and `limit`), kept for Claude to act on.
+class Refusal extends Error {
+  constructor(message, details) {
+    super(message);
+    this.details = details;
+  }
+}
 
 const sleep = (ms, signal) =>
   new Promise((done, fail) => {
@@ -66,7 +75,8 @@ const pathOf = (path) => resolve(isAbsolute(path) ? path : join(config.projectDi
 
 // One call to /v1. A GET, a POST that carries an Idempotency-Key, or one that is safe twice (`retry`) is
 // tried again when the network fails, the service is briefly away, or the rate limit says to wait: none of
-// those can start a second job.
+// those can start a second job. too_many_jobs is a 429 too, but it is not a rate limit: a job ends in
+// minutes, not seconds, so it is said at once, with the jobs to wait on.
 async function api(method, path, { body, idempotencyKey, retry = false, signal, withStatus = false } = {}) {
   if (!config.key) {
     throw new Refusal(
@@ -92,21 +102,21 @@ async function api(method, path, { body, idempotencyKey, retry = false, signal, 
       await sleep(1000 * attempt, signal);
       continue;
     }
-    if (!last && (answer.status === 429 || answer.status === 502 || answer.status === 503 || answer.status === 504)) {
-      const wait = Math.min(Number(answer.headers.get('retry-after')) || attempt * 2, 30);
-      await answer.body?.cancel();
-      await sleep(wait * 1000, signal);
-      continue;
-    }
     const text = await answer.text();
     let data = null;
     try {
       data = JSON.parse(text);
     } catch {}
+    if (!last && [429, 502, 503, 504].includes(answer.status) && data?.error?.code !== 'too_many_jobs') {
+      const wait = Math.min(Number(answer.headers.get('retry-after')) || attempt * 2, 30);
+      await sleep(wait * 1000, signal);
+      continue;
+    }
     if (answer.ok) return withStatus ? { status: answer.status, data } : data;
-    const code = data?.error?.code ?? `http_${answer.status}`;
-    const message = data?.error?.message ?? `CloudBake answered ${answer.status}.`;
-    throw new Refusal(`${message} (${code})`);
+    const { code = `http_${answer.status}`, message = `CloudBake answered ${answer.status}.`, ...more } = data?.error ?? {};
+    // What the API adds to its sentence (the jobs running, the limit) comes after it, as the answers' data does.
+    const extra = Object.keys(more).length ? `\n\n${JSON.stringify(more, null, 2)}` : '';
+    throw new Refusal(`${message} (${code})${extra}`, { code, message, ...more });
   }
 }
 
@@ -199,20 +209,53 @@ function frames(job) {
   return job.kind === 'convert' ? `to ${(job.formats ?? []).join(', ')}` : `${job.frames.done} of ${job.frames.total} frames`;
 }
 
+// "39 s", "1 min 57 s", "2 min".
+function gpuTime(seconds) {
+  const s = Math.round(seconds);
+  if (s < 60) return `${s} s`;
+  return s % 60 ? `${Math.floor(s / 60)} min ${s % 60} s` : `${Math.floor(s / 60)} min`;
+}
+
+// "It cost $0.05: 39 s of GPU time, about 39 s a frame." What a test frame says about the whole job. The API
+// gives `usage` for a job that has ended; an older API gives none, and nothing is said.
+const usageText = ({ usage }) =>
+  usage && usage.cost !== undefined && Number.isFinite(usage.gpu_seconds)
+    ? ` It cost ${usage.cost}: ${gpuTime(usage.gpu_seconds)} of GPU time${usage.frames > 1 && Number.isFinite(usage.per_frame_seconds) ? `, about ${gpuTime(usage.per_frame_seconds)} a frame` : ''}.`
+    : '';
+
 function sayJob(job, { waited = false } = {}) {
   const what = `${job.id} (${job.kind} of ${job.scene})`;
-  if (job.status === 'done') return `${what} is done: ${job.kind === 'convert' ? `converted ${frames(job)}` : `${frames(job)}`}. Call download to save the files.`;
-  if (job.status === 'cancelled') return `${what} was cancelled: ${frames(job)} were made. download saves them.`;
+  if (job.status === 'done') return `${what} is done: ${job.kind === 'convert' ? `converted ${frames(job)}` : frames(job)}.${usageText(job)} Call download to save the files.`;
+  if (job.status === 'cancelled') return `${what} was cancelled: ${frames(job)} were made.${usageText(job)} download saves them.`;
   if (job.status === 'failed') {
     const fix = job.error?.you_can_fix_it === false ? 'The fault was on CloudBake\'s side, so it is not charged: start it again.' : 'Change the scene or the request, then start a new job.';
-    const kept = job.kind === 'render' && job.frames.done > 0 ? ` ${frames(job)} were kept: download saves them.` : '';
+    const kept = job.kind === 'render' && job.frames.done > 0 ? ` ${frames(job)} were kept: download saves them.${usageText(job)}` : '';
     return `${what} failed: ${job.error?.message ?? 'no reason given.'} ${fix}${kept}`;
   }
   const still = waited ? ` Still ${job.status} after ${Math.round(config.waitMs / 60000)} minutes: call status with wait again.` : ' Call status with wait to follow it.';
   return `${what} is ${job.status}: ${frames(job)}.${still}`;
 }
 
-const result = (text, data) => ({ content: [{ type: 'text', text: data === undefined ? text : `${text}\n\n${JSON.stringify(data, null, 2)}` }] });
+// "Balance $5.00. No jobs running; 3 can run at once. A job renders up to 2,000 frames: put many frames in one
+// job rather than many jobs." Where the account stands, from GET /v1/me, in the hosted server's words
+// (lib/account.ts in the cloudbake repo). An older API leaves these fields out: what is missing is not said.
+function accountSentence({ balance, running_jobs: running, limits } = {}) {
+  const parts = [];
+  if (typeof balance?.text === 'string') parts.push(`Balance ${balance.text}.`);
+  const atOnce = limits?.jobs_at_once;
+  if (Array.isArray(running)) {
+    if (running.length) parts.push(`${running.length}${atOnce ? ` of ${atOnce}` : ''} job${running.length === 1 && !atOnce ? '' : 's'} running (${running.join(', ')}).`);
+    else parts.push(`No jobs running${atOnce ? `; ${atOnce} can run at once` : ''}.`);
+  } else if (atOnce) parts.push(`${atOnce} jobs can run at once.`);
+  if (limits?.frames_per_job) parts.push(`A job renders up to ${limits.frames_per_job.toLocaleString('en-US')} frames: put many frames in one job rather than many jobs.`);
+  return parts.join(' ');
+}
+
+// The sentence, then the data as JSON (for a client that reads only the text) and as structuredContent.
+const result = (text, data) => ({
+  content: [{ type: 'text', text: data === undefined ? text : `${text}\n\n${JSON.stringify(data, null, 2)}` }],
+  ...(data && typeof data === 'object' && !Array.isArray(data) ? { structuredContent: data } : {}),
+});
 
 // ---------------------------------------------------------------------------------------------------------
 // The tools
@@ -227,7 +270,7 @@ const tools = [
     name: 'render',
     title: 'Render a Blender scene',
     description:
-      'Render frames of a .blend on CloudBake\'s cloud GPUs. Give exactly one of `file`, `upload` or `sample`. The file is uploaded first, then the job starts and this answers at once with the job: follow it with status (wait: true), then save the frames with download. GPU time is charged to the CloudBake credit; the scene is checked on a CPU first, free, and a scene that cannot render fails there.',
+      `Render frames of a .blend on CloudBake's cloud GPUs. Give exactly one of \`file\`, \`upload\` or \`sample\`. The file is uploaded first, then the job starts and this answers at once with the job: follow it with status (wait: true), then save the frames with download. GPU time is charged to the CloudBake credit; the scene is checked on a CPU first, free, and a scene that cannot render fails there. An account runs ${AT_ONCE} jobs at once (whoami says how many are running): a job beyond that is refused at once with too_many_jobs and the ids to wait on. Put many frames in one job rather than starting many jobs.`,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -264,7 +307,7 @@ const tools = [
   {
     name: 'status',
     title: 'How a CloudBake job is going',
-    description: `A job's status and frames done. With wait: true it waits, telling progress, until the job ends (done, failed or cancelled) or ${Math.round(config.waitMs / 60000)} minutes pass; call it again to keep waiting.`,
+    description: `A job's status and frames done. With wait: true it waits, telling progress, until the job ends (done, failed or cancelled) or ${Math.round(config.waitMs / 60000)} minutes pass; call it again to keep waiting. A job that has ended says what it cost: its GPU time, the price, and the time a frame took, to work out what a longer job would cost.`,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -303,7 +346,8 @@ const tools = [
   {
     name: 'whoami',
     title: 'Check the CloudBake key',
-    description: 'Which CloudBake account and key the plugin uses: the first thing to call when something says the key does not work.',
+    description:
+      'Which CloudBake account and key the plugin uses, with where it stands: its balance, the jobs running now, and the limits (jobs at once, frames a job, file size). Call it before starting several jobs, and when something says the key does not work.',
     inputSchema: { type: 'object', additionalProperties: false, properties: {} },
     annotations: { readOnlyHint: true, openWorldHint: true },
     run: whoami,
@@ -382,7 +426,8 @@ async function cancel({ job: id }, context) {
 
 async function whoami(_args, context) {
   const me = await api('GET', '/v1/me', { signal: context.signal });
-  return result(`The plugin uses the key "${me.key.name}" (ending ${me.key.last_four}) of ${me.email}'s CloudBake account at ${config.origin}.`);
+  const now = accountSentence(me);
+  return result(`The plugin uses the key "${me.key.name}" (ending ${me.key.last_four}) of ${me.email}'s CloudBake account at ${config.origin}.${now ? `\n${now}` : ''}`, me);
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -391,7 +436,8 @@ async function whoami(_args, context) {
 const INSTRUCTIONS = [
   'CloudBake renders Blender scenes on cloud GPUs and converts them to .glb, .fbx or .usdz.',
   'A render: render (file and frames) answers at once with a job id; status with wait: true follows it until it ends; download saves the frames into the project.',
-  'GPU time is charged to the person\'s CloudBake credit: before rendering more than a few frames, render one test frame, show it, and say how many frames the full job is.',
+  "GPU time is charged to the person's CloudBake credit: before rendering more than a few frames, render one test frame, show it, and say how many frames the full job is and what it would cost (status gives the test frame's cost and seconds).",
+  `An account runs ${AT_ONCE} jobs at once; whoami gives the exact limits, the balance and the jobs running now. Render many frames as one job (up to ${FRAMES_A_JOB} frames), not as many jobs: a job beyond the limit is refused, not queued.`,
 ].join(' ');
 
 const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -415,7 +461,7 @@ async function call(params, id) {
     if (controller.signal.aborted) return null;
     const text = error instanceof Refusal ? error.message : `Something went wrong in the CloudBake plugin: ${error.message}`;
     if (!(error instanceof Refusal)) console.error(error);
-    return { result: { content: [{ type: 'text', text }], isError: true } };
+    return { result: { content: [{ type: 'text', text }], ...(error.details ? { structuredContent: { error: error.details } } : {}), isError: true } };
   } finally {
     running.delete(id);
   }

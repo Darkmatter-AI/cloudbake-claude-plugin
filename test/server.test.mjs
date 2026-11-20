@@ -16,10 +16,13 @@ let fake;
 let project;
 
 before(async () => {
-  fake = await startFakeApi();
+  // The tests share this fake and leave jobs running, so its jobs-at-once limit is out of the way; the tests
+  // of the limit start a fake of their own (limitedApi).
+  fake = await startFakeApi({ jobsAtOnce: 1000 });
   project = await mkdtemp(join(tmpdir(), 'cloudbake-plugin-'));
   await writeFile(join(project, 'scene.blend'), BLEND);
   await writeFile(join(project, 'broken.blend'), BLEND);
+  await writeFile(join(project, 'flaky.blend'), BLEND);
   await writeFile(join(project, 'notes.txt'), 'not a scene');
 });
 const children = new Set();
@@ -97,12 +100,122 @@ test('initialize answers the protocol the client asked for, and lists six tools 
   await mcp.close();
 });
 
-test('whoami names the account and the key', async () => {
+test('the instructions and the descriptions say the limits, one job for many frames, and the cost of a test frame', async () => {
   const mcp = connect();
-  const answer = await mcp.tool('whoami');
+  const { instructions } = (await mcp.ask('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } })).result;
+  assert.match(instructions, /An account runs 3 jobs at once; whoami gives the exact limits, the balance and the jobs running now\./);
+  assert.match(instructions, /Render many frames as one job \(up to 2,000 frames\), not as many jobs: a job beyond the limit is refused, not queued\./);
+  assert.match(instructions, /say how many frames the full job is and what it would cost \(status gives the test frame's cost and seconds\)/);
+  const tools = Object.fromEntries((await mcp.ask('tools/list', {})).result.tools.map((tool) => [tool.name, tool.description]));
+  assert.match(tools.render, /An account runs 3 jobs at once \(whoami says how many are running\): a job beyond that is refused at once with too_many_jobs and the ids to wait on\. Put many frames in one job/);
+  assert.match(tools.whoami, /its balance, the jobs running now, and the limits \(jobs at once, frames a job, file size\)\. Call it before starting several jobs/);
+  assert.match(tools.status, /says what it cost/);
+  await mcp.close();
+});
+
+// A fake with the real limit (3 jobs at once), so the tests of it start from no jobs running.
+async function limitedApi() {
+  const api = await startFakeApi();
+  return { api, mcp: connect({ CLOUDBAKE_URL: api.origin }), close: async (mcp) => (await mcp.close(), await api.close()) };
+}
+
+test('whoami names the account and the key, and says the balance, the jobs running and the limits', async () => {
+  const { api, mcp, close } = await limitedApi();
+  let answer = await mcp.tool('whoami');
   assert.equal(answer.isError, undefined);
   assert.match(answer.text, /"Claude Code" \(ending 4567\) of ana@studio.com/);
+  assert.match(answer.text, /\nBalance \$5\.00\. No jobs running; 3 can run at once\. A job renders up to 2,000 frames: put many frames in one job rather than many jobs\./);
+  assert.deepEqual(answer.structuredContent.limits, { jobs_at_once: 3, frames_per_job: 2000, upload_bytes: 4 * 1024 ** 3 });
+  assert.deepEqual(answer.structuredContent.balance, { cents: 500, text: '$5.00' });
+  assert.deepEqual(answer.structuredContent.running_jobs, []);
+  assert.deepEqual(jobOf(answer.text), answer.structuredContent, 'the same data in the text, for a client that reads only that');
+
+  const job = jobOf((await mcp.tool('render', { sample: true, frames: '1-4' })).text);
+  answer = await mcp.tool('whoami');
+  assert.match(answer.text, new RegExp(`Balance \\$5\\.00\\. 1 of 3 jobs running \\(${job.id}\\)\\. A job renders up to 2,000 frames`));
+  assert.deepEqual(answer.structuredContent.running_jobs, [job.id]);
+  assert.equal(api.state.calls.filter((call) => call.path === '/v1/me').length, 2);
+  await close(mcp);
+});
+
+test('whoami still works with an API that does not say the balance, the jobs or the limits', async () => {
+  const mcp = connect();
+  fake.state.oldMe = true;
+  const answer = await mcp.tool('whoami');
+  fake.state.oldMe = false;
+  assert.equal(answer.isError, undefined, answer.text);
+  assert.match(answer.text, /^The plugin uses the key "Claude Code" \(ending 4567\) of ana@studio\.com's CloudBake account at http:\/\/127\.0\.0\.1:\d+\.\n\n\{/);
+  assert.doesNotMatch(answer.text, /Balance|running|at once|undefined/);
+  assert.deepEqual(answer.structuredContent, { email: 'ana@studio.com', key: { name: 'Claude Code', last_four: '4567' } });
   await mcp.close();
+});
+
+test('a job that has ended says what it cost: done, cancelled, and failed with frames kept', async () => {
+  const mcp = connect();
+  // Three frames: the cost, the GPU time and the time a frame took.
+  let job = jobOf((await mcp.tool('render', { file: 'scene.blend', frames: '1-3' })).text);
+  let answer = await mcp.tool('status', { job: job.id, wait: true });
+  assert.match(answer.text, /is done: 3 of 3 frames\. It cost \$0\.15: 1 min 57 s of GPU time, about 39 s a frame\. Call download to save the files\./);
+  assert.deepEqual(answer.structuredContent.usage, { frames: 3, gpu_seconds: 117, cost_cents: 15, cost: '$0.15', per_frame_seconds: 39 });
+
+  // One test frame: its cost and seconds, with no "a frame" to repeat.
+  job = jobOf((await mcp.tool('render', { upload: job.upload, frames: 1 })).text);
+  answer = await mcp.tool('status', { job: job.id, wait: true });
+  assert.match(answer.text, /is done: 1 of 1 frames\. It cost \$0\.05: 39 s of GPU time\. Call download/);
+
+  // Cancelled after two frames: what those cost.
+  job = jobOf((await mcp.tool('render', { sample: true, frames: '1-24' })).text);
+  for (let ask = 0; ask < 5; ask += 1) answer = await mcp.tool('status', { job: job.id }); // checking, rendering 0, 1, 2, 3
+  assert.match(answer.text, /is rendering: 3 of 24 frames\. Call status with wait/);
+  assert.doesNotMatch(answer.text, /cost/, 'a job still going says no cost');
+  await mcp.tool('cancel', { job: job.id });
+  answer = await mcp.tool('status', { job: job.id });
+  assert.match(answer.text, /was cancelled: 3 of 24 frames were made\. It cost \$0\.15: 1 min 57 s of GPU time, about 39 s a frame\. download saves them\./);
+
+  // Failed after a frame, on CloudBake's side: the frame kept, and what it cost.
+  job = jobOf((await mcp.tool('render', { file: 'flaky.blend', frames: '1-3' })).text);
+  answer = await mcp.tool('status', { job: job.id, wait: true });
+  assert.match(answer.text, /failed: The GPU stopped answering\. The fault was on CloudBake's side, so it is not charged: start it again\. 1 of 3 frames were kept: download saves them\. It cost \$0\.05: 39 s of GPU time\./);
+
+  // A failure before any frame, and a convert, have no usage: nothing is said.
+  job = jobOf((await mcp.tool('render', { file: 'broken.blend', frames: 1 })).text);
+  assert.doesNotMatch((await mcp.tool('status', { job: job.id, wait: true })).text, /cost/);
+  job = jobOf((await mcp.tool('convert', { upload: job.upload, formats: ['glb'] })).text);
+  assert.doesNotMatch((await mcp.tool('status', { job: job.id, wait: true })).text, /cost/);
+  await mcp.close();
+});
+
+test('a job beyond the jobs-at-once limit is refused at once with the jobs running and the limit, and not tried again', async () => {
+  const { api, mcp, close } = await limitedApi();
+  const ids = [];
+  for (let start = 0; start < 3; start += 1) ids.push(jobOf((await mcp.tool('render', { sample: true, frames: '1-4' })).text).id);
+  const posts = () => api.state.calls.filter((call) => call.method === 'POST' && call.path === '/v1/jobs').length;
+  const before = posts();
+  const started = Date.now();
+
+  const refused = await mcp.tool('render', { sample: true, frames: '1-4' });
+  assert.equal(refused.isError, true);
+  assert.equal(posts(), before + 1, 'asked once: too_many_jobs is not a rate limit to wait out');
+  assert.ok(Date.now() - started < 900, 'answered without waiting');
+  assert.match(refused.text, new RegExp(`^This account already has 3 jobs running \\(${ids.join(', ')}\\), and 3 run at once\\..* \\(too_many_jobs\\)`));
+  assert.deepEqual(refused.structuredContent.error.running, ids);
+  assert.equal(refused.structuredContent.error.limit, 3);
+  assert.equal(refused.structuredContent.error.code, 'too_many_jobs');
+  assert.deepEqual(jobOf(refused.text), { running: ids, limit: 3 }, 'and in the text, for a client that reads only that');
+
+  // A convert is a job too. The file is sent, then the job is refused the same way.
+  const convert = await mcp.tool('convert', { file: 'scene.blend', formats: ['glb'] });
+  assert.equal(convert.isError, true);
+  assert.deepEqual(convert.structuredContent.error.running, ids);
+
+  // Once a job ends there is room; a real rate limit is still waited out and tried again.
+  await mcp.tool('cancel', { job: ids[0] });
+  api.state.rateLimitOnce = true;
+  const after = posts();
+  const again = await mcp.tool('render', { sample: true, frames: '1-4' });
+  assert.equal(again.isError, undefined, again.text);
+  assert.equal(posts(), after + 2, 'rate_limited, then started');
+  await close(mcp);
 });
 
 test('render a file: it is sent whole, the job starts on it, status follows it to done, download saves the frames', async () => {

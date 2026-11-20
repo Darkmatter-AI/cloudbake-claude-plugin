@@ -1,6 +1,7 @@
 // A stand-in for CloudBake's /v1 and for storage, on localhost, for the plugin's tests: the answers have
 // the shapes https://cloudbake.ai/docs/api describes. A job moves one step each time it is asked about: queued,
-// checking, rendering (a frame more each time), done. Run it alone to try the plugin in Claude Code
+// checking, rendering (a frame more each time), done. A render that has ended says what it cost (39 s and
+// $0.05 a frame), and a job beyond `jobsAtOnce` running is refused with too_many_jobs. Run it alone to try the plugin in Claude Code
 // without spending anything: `node claude-plugin/test/fake-api.mjs --serve` prints its address. (Without
 // --serve it does nothing, because `node --test` runs every file in a test folder.)
 import { createServer } from 'node:http';
@@ -35,9 +36,21 @@ function parseFrames(value) {
   return out;
 }
 
-export async function startFakeApi({ steps = 1 } = {}) {
-  const state = { uploads: new Map(), jobs: new Map(), puts: [], calls: [], idempotency: new Map(), outOfCredit: false };
+export const FRAME_SECONDS = 39;
+const FRAME_CENTS = 5;
+const ENDED = ['done', 'failed', 'cancelled'];
+
+// `oldMe`: GET /v1/me as the API answered before it said the balance, the jobs running and the limits.
+// `rateLimitOnce`: the next POST /v1/jobs answers 429 rate_limited, once.
+export async function startFakeApi({ steps = 1, jobsAtOnce = 3 } = {}) {
+  const state = { uploads: new Map(), jobs: new Map(), puts: [], calls: [], idempotency: new Map(), outOfCredit: false, oldMe: false, rateLimitOnce: false, balanceCents: 500 };
   let origin = '';
+  const running = () => [...state.jobs.values()].filter((job) => !ENDED.includes(job.status)).map((job) => job.id);
+  const usageOf = (job) => {
+    if (!ENDED.includes(job.status) || job.kind !== 'render' || job.done === 0) return null;
+    const cents = job.done * FRAME_CENTS;
+    return { frames: job.done, gpu_seconds: job.done * FRAME_SECONDS, cost_cents: cents, cost: `$${(cents / 100).toFixed(2)}`, per_frame_seconds: FRAME_SECONDS };
+  };
 
   const jobView = (job) => ({
     id: job.id,
@@ -52,6 +65,7 @@ export async function startFakeApi({ steps = 1 } = {}) {
     created_at: '2026-11-18T10:00:00.000Z',
     started_at: null,
     finished_at: null,
+    usage: usageOf(job),
     links: { self: `${origin}/v1/jobs/${job.id}`, files: `${origin}/v1/jobs/${job.id}/files` },
   });
   const uploadView = (upload) => ({
@@ -76,8 +90,9 @@ export async function startFakeApi({ steps = 1 } = {}) {
       else if (job.status === 'rendering') {
         job.done += 1;
         if (job.done >= job.frames.length) job.status = 'done';
+        else if (job.failAfterFrame) job.status = 'failed';
       }
-      if (job.status === 'failed') job.error = job.failWith;
+      if (job.status === 'failed') job.error = job.failWith ?? job.failAfterFrame;
     }
   };
 
@@ -90,7 +105,7 @@ export async function startFakeApi({ steps = 1 } = {}) {
       response.writeHead(status, { 'content-type': 'application/json', ...headers });
       response.end(JSON.stringify(body));
     };
-    const error = (status, code, message) => send(status, { error: { code, message } });
+    const error = (status, code, message, more = {}, headers = {}) => send(status, { error: { code, message, ...more } }, headers);
 
     // Storage: an upload's PUT and a job's files.
     if (url.pathname.startsWith('/r2/')) {
@@ -113,7 +128,17 @@ export async function startFakeApi({ steps = 1 } = {}) {
     const body = raw.length ? JSON.parse(raw.toString()) : {};
     const parts = url.pathname.split('/').filter(Boolean); // v1, jobs, rq_…, files
 
-    if (request.method === 'GET' && url.pathname === '/v1/me') return send(200, { email: 'ana@studio.com', key: { name: 'Claude Code', last_four: FAKE_KEY.slice(-4) } });
+    if (request.method === 'GET' && url.pathname === '/v1/me') {
+      const me = { email: 'ana@studio.com', key: { name: 'Claude Code', last_four: FAKE_KEY.slice(-4) } };
+      if (state.oldMe) return send(200, me);
+      const cents = state.balanceCents;
+      return send(200, {
+        ...me,
+        balance: { cents, text: `$${(cents / 100).toFixed(2)}` },
+        running_jobs: running(),
+        limits: { jobs_at_once: jobsAtOnce, frames_per_job: 2000, upload_bytes: 4 * 1024 ** 3 },
+      });
+    }
 
     if (request.method === 'POST' && url.pathname === '/v1/uploads') {
       const upload = { id: `up_${hex(8)}`, status: 'waiting', name: body.name ?? 'scene.blend', bytes: body.bytes ?? null, received: null };
@@ -124,7 +149,21 @@ export async function startFakeApi({ steps = 1 } = {}) {
     if (request.method === 'POST' && url.pathname === '/v1/jobs') {
       const key = request.headers['idempotency-key'];
       if (key && state.idempotency.has(key)) return send(200, jobView(state.jobs.get(state.idempotency.get(key))));
+      if (state.rateLimitOnce) {
+        state.rateLimitOnce = false;
+        return error(429, 'rate_limited', 'Too many new jobs this minute. Wait a moment, then try again.', {}, { 'retry-after': '1' });
+      }
       if (state.outOfCredit) return error(402, 'out_of_credit', 'Your balance is $0.00, so no new job can start. Add credit at https://cloudbake.ai/app/credits: jobs start again at once.');
+      const ids = running();
+      if (ids.length >= jobsAtOnce) {
+        return error(
+          429,
+          'too_many_jobs',
+          `This account already has ${ids.length} job${ids.length === 1 ? '' : 's'} running (${ids.join(', ')}), and ${jobsAtOnce} run at once. Nothing was started and nothing is charged. Wait for one to end, or cancel one, then start this again. To render many frames, put them in one job: up to 2,000 frames a job.`,
+          { running: ids, limit: jobsAtOnce },
+          { 'retry-after': '1' },
+        );
+      }
       let scene = 'sample';
       if (body.upload) {
         const upload = state.uploads.get(body.upload);
@@ -147,6 +186,8 @@ export async function startFakeApi({ steps = 1 } = {}) {
         options: Object.fromEntries(Object.entries(body).filter(([name]) => ['samples', 'width', 'height', 'engine', 'draco'].includes(name))),
         error: null,
         failWith: scene === 'broken.blend' ? { code: 'no_camera', message: 'The scene has no camera. Add one and set it as the scene camera.', you_can_fix_it: true } : null,
+        // flaky.blend renders one frame, then the GPU goes away: a failed job that kept a frame, and charged it.
+        failAfterFrame: scene === 'flaky.blend' ? { code: 'gpu_lost', message: 'The GPU stopped answering.', you_can_fix_it: false } : null,
       };
       state.jobs.set(job.id, job);
       if (key) state.idempotency.set(key, job.id);
@@ -161,7 +202,7 @@ export async function startFakeApi({ steps = 1 } = {}) {
         return send(200, jobView(job));
       }
       if (request.method === 'GET' && parts[3] === 'files') {
-        const ended = ['done', 'failed', 'cancelled'].includes(job.status);
+        const ended = ENDED.includes(job.status);
         const frames = job.frames.slice(0, job.done).map((frame) => {
           const name = `frame_${String(frame).padStart(5, '0')}.png`;
           return { name, frame, bytes: PNG.length, url: `${origin}/r2/outputs/${job.id}/${name}` };
@@ -170,7 +211,7 @@ export async function startFakeApi({ steps = 1 } = {}) {
         return send(200, { job: jobView(job), files, ...(ended ? {} : { note: 'The files are listed once the job has ended.' }) });
       }
       if (request.method === 'POST' && parts[3] === 'cancel') {
-        if (['done', 'failed', 'cancelled'].includes(job.status)) return send(200, jobView(job));
+        if (ENDED.includes(job.status)) return send(200, jobView(job));
         job.status = 'cancelled';
         return send(202, jobView(job));
       }
