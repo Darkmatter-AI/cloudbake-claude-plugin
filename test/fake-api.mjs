@@ -1,7 +1,8 @@
 // A stand-in for CloudBake's /v1 and for storage, on localhost, for the plugin's tests: the answers have
 // the shapes https://cloudbake.ai/docs/api describes. A job moves one step each time it is asked about: queued,
 // checking, rendering (a frame more each time), done. A render that has ended says what it cost (39 s and
-// $0.05 a frame), and a job beyond `jobsAtOnce` running is refused with too_many_jobs. Run it alone to try the plugin in Claude Code
+// $0.05 a frame), and a job beyond `jobsAtOnce` running is refused with too_many_jobs. An MP4 of a render moves
+// too: queued, encoding (gathering its frames, then encoding them), done. Run it alone to try the plugin in Claude Code
 // without spending anything: `node claude-plugin/test/fake-api.mjs --serve` prints its address. (Without
 // --serve it does nothing, because `node --test` runs every file in a test folder.)
 import { createServer } from 'node:http';
@@ -24,6 +25,8 @@ function png() {
   return Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), chunk('IHDR', header), chunk('IDAT', deflateSync(Buffer.concat([row, row]))), chunk('IEND', Buffer.alloc(0))]);
 }
 export const PNG = png();
+// The MP4 every export makes: an ftyp box and some bytes. Not a video, but the plugin only saves it.
+export const MP4 = Buffer.concat([Buffer.from('000000186674797069736f6d0000020069736f6d69736f32', 'hex'), Buffer.from('fake H.264 frames')]);
 
 const hex = (bytes) => randomBytes(bytes).toString('hex');
 
@@ -36,6 +39,20 @@ function parseFrames(value) {
   return out;
 }
 
+// "1-2, 5-8": frames as a list the API takes, as the Video's frames.list gives it.
+function listText(frames) {
+  const spans = [];
+  for (const frame of [...new Set(frames)].sort((a, b) => a - b)) {
+    const last = spans.at(-1);
+    if (last && frame === last[1] + 1) last[1] = frame;
+    else spans.push([frame, frame]);
+  }
+  return spans.map(([first, last]) => (first === last ? `${first}` : `${first}-${last}`)).join(', ');
+}
+
+const FRAME_LIST = /^\s*\d+(\s*-\s*\d+)?\s*$/;
+const VIDEO_ACTIVE = ['queued', 'encoding'];
+
 export const FRAME_SECONDS = 39;
 const FRAME_CENTS = 5;
 const ENDED = ['done', 'failed', 'cancelled'];
@@ -43,7 +60,7 @@ const ENDED = ['done', 'failed', 'cancelled'];
 // `oldMe`: GET /v1/me as the API answered before it said the balance, the jobs running and the limits.
 // `rateLimitOnce`: the next POST /v1/jobs answers 429 rate_limited, once.
 export async function startFakeApi({ steps = 1, jobsAtOnce = 3 } = {}) {
-  const state = { uploads: new Map(), jobs: new Map(), puts: [], calls: [], idempotency: new Map(), outOfCredit: false, oldMe: false, rateLimitOnce: false, balanceCents: 500 };
+  const state = { uploads: new Map(), jobs: new Map(), puts: [], calls: [], idempotency: new Map(), outOfCredit: false, oldMe: false, rateLimitOnce: false, balanceCents: 500, videos: new Map(), holdVideos: false };
   let origin = '';
   const running = () => [...state.jobs.values()].filter((job) => !ENDED.includes(job.status)).map((job) => job.id);
   const usageOf = (job) => {
@@ -82,6 +99,31 @@ export async function startFakeApi({ steps = 1, jobsAtOnce = 3 } = {}) {
     expires_at: null,
     links: { self: `${origin}/v1/uploads/${upload.id}` },
   });
+  // The shape of the API's Video (https://cloudbake.ai/docs/api, Videos).
+  const videoView = (video) => ({
+    id: video.id,
+    job: video.job,
+    status: video.status,
+    phase: VIDEO_ACTIVE.includes(video.status) ? video.phase : null,
+    frames: { total: video.frames.length, done: video.done, list: listText(video.frames) },
+    fps: video.fps,
+    duration_s: Math.round((video.frames.length / video.fps) * 1000) / 1000,
+    width: video.width,
+    height: video.height,
+    bytes: video.bytes,
+    url: video.status === 'done' ? `${origin}/r2/outputs/${video.job}/videos/${video.id}.mp4` : null,
+    error: null,
+    created_at: '2026-11-18T10:05:00.000Z',
+    finished_at: video.status === 'done' ? '2026-11-18T10:05:27.000Z' : null,
+    links: { self: `${origin}/v1/jobs/${video.job}/videos/${video.id}`, job: `${origin}/v1/jobs/${video.job}` },
+  });
+  const advanceVideo = (video) => {
+    for (let step = 0; step < (state.holdVideos ? 0 : steps); step += 1) {
+      if (video.status === 'queued') Object.assign(video, { status: 'encoding', phase: 'gathering', done: Math.floor(video.frames.length / 2) });
+      else if (video.status === 'encoding' && video.phase === 'gathering') Object.assign(video, { phase: 'encoding', done: video.frames.length });
+      else if (video.status === 'encoding') Object.assign(video, { status: 'done', phase: null, width: 2, height: 2, bytes: MP4.length });
+    }
+  };
   const advance = (job) => {
     for (let step = 0; step < steps; step += 1) {
       if (job.status === 'queued') job.status = 'checking';
@@ -119,7 +161,8 @@ export async function startFakeApi({ steps = 1, jobsAtOnce = 3 } = {}) {
         return;
       }
       const name = url.pathname.split('/').pop();
-      response.writeHead(200, { 'content-type': 'application/octet-stream' }).end(name.endsWith('.png') ? PNG : Buffer.from(`fake ${name}`));
+      const file = name.endsWith('.png') ? PNG : name.endsWith('.mp4') ? MP4 : Buffer.from(`fake ${name}`);
+      response.writeHead(200, { 'content-type': name.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream' }).end(file);
       return;
     }
 
@@ -214,6 +257,38 @@ export async function startFakeApi({ steps = 1, jobsAtOnce = 3 } = {}) {
         if (ENDED.includes(job.status)) return send(200, jobView(job));
         job.status = 'cancelled';
         return send(202, jobView(job));
+      }
+      // An MP4 of the frames a render made: POST /v1/jobs/:id/videos, then GET /v1/jobs/:id/videos/:vid.
+      if (request.method === 'POST' && parts[3] === 'videos' && parts.length === 4) {
+        const made = job.frames.slice(0, job.done);
+        if (job.kind !== 'render' || !['done', 'failed', 'cancelled'].includes(job.status) || made.length < 2) return error(409, 'no_video', 'An MP4 is made of a finished render with at least 2 frames.');
+        const unknown = Object.keys(body).find((name) => !['frames', 'leave_out', 'fps'].includes(name));
+        if (unknown) return error(400, 'bad_request', `“${unknown}” is not a field of an MP4. Its fields are frames, leave_out and fps, each optional.`);
+        let frames = made;
+        for (const field of ['frames', 'leave_out']) {
+          if (body[field] === undefined) continue;
+          const bad = String(body[field]).split(',').find((part) => !FRAME_LIST.test(part));
+          if (bad !== undefined) return error(400, 'bad_frames', `“${bad.trim().slice(0, 20)}” is not a frame number or a range like 25-30.`, { field });
+          const named = parseFrames(body[field]);
+          const gone = named.filter((frame) => !made.includes(frame));
+          if (gone.length) return error(400, 'bad_frames', `${gone.length > 1 ? 'Frames' : 'Frame'} ${listText(gone)} ${gone.length > 1 ? 'are' : 'is'} not in this render. It has frames ${listText(made)}.`, { field });
+          frames = field === 'frames' ? frames.filter((frame) => named.includes(frame)) : frames.filter((frame) => !named.includes(frame));
+        }
+        if (frames.length < 2) return error(400, 'bad_frames', 'That leaves fewer than 2 frames. A video needs at least 2.', { field: body.leave_out !== undefined ? 'leave_out' : 'frames' });
+        const fps = body.fps === undefined ? 24 : Number(body.fps);
+        if (!(fps >= 1 && fps <= 120)) return error(400, 'bad_fps', 'The frame rate is a number from 1 to 120, like 24 or 23.976.', { field: 'fps' });
+        const running = [...state.videos.values()].filter((video) => VIDEO_ACTIVE.includes(video.status));
+        if (running.some((video) => video.job === job.id)) return error(409, 'video_running', 'An MP4 of this render is being made. Make the next one when it is ready.');
+        if (running.length >= 3) return error(429, 'videos_at_once', '3 MP4s are being made for your account. Make this one when one of them is ready.');
+        const video = { id: `vid_${hex(8)}`, job: job.id, status: 'queued', phase: null, frames: [...new Set(frames)].sort((a, b) => a - b), done: 0, fps, width: null, height: null, bytes: null };
+        state.videos.set(video.id, video);
+        return send(202, videoView(video), { location: `${origin}/v1/jobs/${job.id}/videos/${video.id}` });
+      }
+      if (request.method === 'GET' && parts[3] === 'videos' && parts.length === 5) {
+        const video = state.videos.get(parts[4]);
+        if (!video || video.job !== job.id) return error(404, 'video_not_found', 'This job has no MP4 with this id. POST /v1/jobs/{id}/videos answers the id of each one it starts.');
+        advanceVideo(video);
+        return send(200, videoView(video));
       }
     }
     return error(404, 'not_found', 'There is nothing at this address.');

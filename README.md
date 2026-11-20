@@ -57,6 +57,7 @@ Ask in your own words:
 - "Render frame 1 of kitchen.blend with CloudBake."
 - "Render frames 1-120 of cave_walk.blend at 1920x1080, 128 samples, into renders/cave."
 - "Convert kitchen.blend to .glb and .usdz."
+- "Make an MP4 of that render, leaving out frames 25-30."
 - `/cloudbake:render kitchen.blend 1-24`
 
 The first time, Claude Code asks you to allow the cloudbake tools. Claude checks the scene, renders one test
@@ -100,6 +101,7 @@ animation in one job (up to 2,000 frames) rather than starting many.
 | `download` | Saves what a job made into a folder: one PNG a frame, frames.zip, or the converted files. |
 | `cancel` | Stops a job. Frames already made are kept. |
 | `whoami` | Which account and key the plugin uses, its balance, the jobs running now, and the limits. |
+| `video` | Makes an MP4 of a finished render's frames (all, or `frames` / `leave_out`), free in the beta, and saves it into `renders/<job id>/`. |
 
 The plugin calls the same API as the [quickstart](https://cloudbake.ai/docs/quickstart) and the
 [API reference](https://cloudbake.ai/docs/api). Your files go straight to storage, and the frames come straight
@@ -113,7 +115,7 @@ back.
 | `.claude-plugin/marketplace.json` | The marketplace this repository is, listing the plugin at its root. |
 | `.mcp.json` | Starts the server with `node`, and passes it the key and the project folder. |
 | `server/cloudbake-mcp.mjs` | The MCP server: plain Node, no packages, over stdio. |
-| `skills/render/SKILL.md` | How Claude renders with it: check the scene, one test frame first, follow, download. |
+| `skills/render/SKILL.md` | How Claude renders with it: check the scene, one test frame first, follow, download, an MP4. |
 | `test/` | Tests of the server against a fake API (`fake-api.mjs`). |
 
 - **Test:** `node --test test/*.mjs` (Node 22 or later, for the fake API's PNG). Nothing is sent to CloudBake.

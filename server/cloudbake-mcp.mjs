@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // CloudBake's MCP server for Claude Code. It renders a .blend from this computer on CloudBake's
-// cloud GPUs and saves what the job made back into the project folder.
+// cloud GPUs and saves what the job made back into the project folder, and makes an MP4 of a render's frames.
 //
 // It speaks MCP over stdio (one JSON-RPC 2.0 message a line) and calls the public API, the same one
 // https://cloudbake.ai/docs/api describes, with the user's API key. A file goes from the disk straight to
@@ -13,7 +13,7 @@
 //   CLOUDBAKE_API_KEY      used when the plugin has none: the quickstart's variable
 //   CLOUDBAKE_PROJECT_DIR  what relative paths are relative to (.mcp.json passes ${CLAUDE_PROJECT_DIR})
 //   CLOUDBAKE_URL          the API's address, https://cloudbake.ai unless set (for tests)
-//   CLOUDBAKE_POLL_MS, CLOUDBAKE_WAIT_SECONDS   how often, and how long at most, `status` asks while it waits
+//   CLOUDBAKE_POLL_MS, CLOUDBAKE_WAIT_SECONDS   how often, and how long at most, `status` and `video` ask while they wait
 
 import { createReadStream, createWriteStream } from 'node:fs';
 import { mkdir, open, rename, rm, stat } from 'node:fs/promises';
@@ -25,13 +25,14 @@ import { createInterface } from 'node:readline';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 // MCP versions this server speaks, newest first. Nothing it uses changed between them.
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 const MAX_FILE = 4 * 1024 ** 3; // the API's limit: 4 GiB
 const ENDED = new Set(['done', 'failed', 'cancelled']);
 const JOB_ID = /^rq_[0-9a-f]{8,32}$/;
 const UPLOAD_ID = /^up_[0-9a-f]{16}$/;
+const VIDEO_ID = /^vid_[0-9a-f]{16}$/;
 const KEY = /^cb_live_[0-9a-f]{40}$/;
 const CONNECTIONS = 'https://cloudbake.ai/app/connections';
 // The limits as the tools' descriptions say them. whoami reads the account's own from GET /v1/me.
@@ -113,10 +114,12 @@ async function api(method, path, { body, idempotencyKey, retry = false, signal, 
       continue;
     }
     if (answer.ok) return withStatus ? { status: answer.status, data } : data;
-    const { code = `http_${answer.status}`, message = `CloudBake answered ${answer.status}.`, ...more } = data?.error ?? {};
+    const { code = `http_${answer.status}`, message = `CloudBake answered ${answer.status}.`, field, ...more } = data?.error ?? {};
     // What the API adds to its sentence (the jobs running, the limit) comes after it, as the answers' data does.
+    // The field a refusal is about is said in the sentence, as the hosted server says it.
+    const about = typeof field === 'string' ? `, in \`${field}\`` : '';
     const extra = Object.keys(more).length ? `\n\n${JSON.stringify(more, null, 2)}` : '';
-    throw new Refusal(`${message} (${code})${extra}`, { code, message, ...more });
+    throw new Refusal(`${message} (${code}${about})${extra}`, { code, message, ...(about ? { field } : {}), ...more });
   }
 }
 
@@ -188,9 +191,9 @@ async function upload(path, context) {
 }
 
 // Save one link's file at `to`, through a temporary name, so a broken download leaves no half file.
-async function saveFile(url, to, signal) {
+async function saveFile(url, to, signal, again = 'try download again') {
   const answer = await fetch(url, { signal });
-  if (!answer.ok || !answer.body) throw new Refusal(`Could not download ${basename(to)} (${answer.status}). The links last an hour: try download again.`);
+  if (!answer.ok || !answer.body) throw new Refusal(`Could not download ${basename(to)} (${answer.status}). The links last an hour: ${again}.`);
   const part = `${to}.part-${process.pid}`;
   try {
     await pipeline(Readable.fromWeb(answer.body), createWriteStream(part));
@@ -234,6 +237,40 @@ function sayJob(job, { waited = false } = {}) {
   }
   const still = waited ? ` Still ${job.status} after ${Math.round(config.waitMs / 60000)} minutes: call status with wait again.` : ' Call status with wait to follow it.';
   return `${what} is ${job.status}: ${frames(job)}.${still}`;
+}
+
+// What an MP4 says, in a sentence: as the hosted server's video tool says it, with the file saved here.
+
+// "24", "23.976".
+const fpsText = (fps) => String(Math.round(fps * 1000) / 1000);
+
+// "2.75 s", "1 min 23.33 s".
+function durationText(seconds) {
+  const hundredths = Math.round(seconds * 100);
+  const minutes = Math.floor(hundredths / 6000);
+  const rest = String((hundredths - minutes * 6000) / 100);
+  return minutes ? `${minutes} min ${rest} s` : `${rest} s`;
+}
+
+// "820 KB", "312 MB", "1.2 GB", counted in 1,024s.
+function sizeText(bytes) {
+  if (bytes <= 0) return '0 KB';
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+  if (bytes >= 1024 ** 2) return `${Math.max(1, Math.round(bytes / 1024 ** 2)).toLocaleString('en-GB')} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+function sayVideo(video, { waited = false, saved } = {}) {
+  const what = `${video.id} (an MP4 of ${video.job})`;
+  const follow = `video with video: "${video.id}" and wait: true`;
+  if (video.status === 'done') {
+    const size = [video.width && video.height ? `${video.width}x${video.height}` : null, video.bytes !== null ? sizeText(video.bytes) : null].filter(Boolean).join(', ');
+    return `${what} is ready: ${video.frames.total} frames (${video.frames.list}) at ${fpsText(video.fps)} FPS, ${durationText(video.duration_s)}${size ? `, ${size}` : ''}. Saved it as ${saved}. CloudBake keeps the MP4 14 days: call video with video: "${video.id}" to save it again.`;
+  }
+  if (video.status === 'failed') return `${what} failed: ${video.error?.message ?? 'no reason given.'}`;
+  const doing = video.phase === 'gathering' ? 'gathering its frames' : video.status === 'queued' || video.phase === 'starting' ? 'starting' : 'encoding';
+  const still = waited ? ` Still not ready after ${Math.round(config.waitMs / 60000)} minutes: call ${follow} again.` : ` Call ${follow} to follow it.`;
+  return `${what} is ${doing}: ${video.frames.done} of ${video.frames.total} frames.${still}`;
 }
 
 // "Balance $5.00. No jobs running; 3 can run at once. A job renders up to 2,000 frames: put many frames in one
@@ -352,6 +389,31 @@ const tools = [
     annotations: { readOnlyHint: true, openWorldHint: true },
     run: whoami,
   },
+  {
+    name: 'video',
+    title: 'Make an MP4 of a CloudBake render',
+    description: [
+      "Make an MP4 (H.264) of a finished render's frames, on CloudBake's side: nothing renders again, and it is free while CloudBake is in beta. The render has ended with at least 2 frames, in the last 14 days.",
+      'Every frame by default; `frames` picks some ("1-24, 31-72") and `leave_out` cuts some ("25-30"), with nothing in their place. Only frames the render made may be named. The frame rate is the scene\'s unless `fps` is given.',
+      `With wait: true it waits until the MP4 is ready (usually within a minute, ${Math.round(config.waitMs / 60000)} minutes a call at most); once it is ready, it is saved as renders/<job id>/<vid>.mp4, or in \`folder\`. Give \`video\` (vid_…) instead of the frames to follow one already started, or to save it again. One MP4 of a render at a time, three of an account at once.`,
+    ].join(' '),
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['job'],
+      properties: {
+        job: { type: 'string', pattern: JOB_ID.source, description: 'The render, rq_…' },
+        frames: { type: ['string', 'integer'], description: 'The frames to use: a list like "1-24, 31-72", or a frame number. Left out: every frame the render made.' },
+        leave_out: { type: ['string', 'integer'], description: 'Frames to cut from those, like "25-30": cut, with no pause in their place.' },
+        fps: { type: ['number', 'string'], description: "Frames a second, 1 to 120, like 24 or 23.976. Left out: the scene's own, or 24 when the job does not say." },
+        video: { type: 'string', pattern: VIDEO_ID.source, description: 'An MP4 already started (vid_…), to follow it or save it again, instead of making another.' },
+        wait: { type: 'boolean', description: 'Wait for the MP4 to be ready.' },
+        folder: { type: 'string', description: 'Where to save the MP4: a path, absolute or relative to the project folder; made if missing. Default: renders/<job id>.' },
+      },
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    run: video,
+  },
 ];
 
 // The scene of a job: an upload of this computer's file, an earlier upload, or the sample.
@@ -424,6 +486,68 @@ async function cancel({ job: id }, context) {
   return result(asked === 200 ? `${id} had ended already (${job.status}): nothing changed.` : `Asked CloudBake to cancel ${id}. Frames already made are kept; status says cancelled once no frame of it is on a GPU.`, job);
 }
 
+const VIDEO_FIELDS = ['frames', 'leave_out', 'fps'];
+const VIDEO_ACTIVE = new Set(['queued', 'encoding']);
+// job id → the MP4 of it this server started last. The API's refusal of a second start does not name the one
+// being made, so this is how the refusal points at it.
+const videosStarted = new Map();
+
+// The refusal of a second MP4 of a job, pointing at the one being made when this server started it.
+async function videoRunning(error, id, signal) {
+  const started = videosStarted.get(id);
+  let running = null;
+  if (started) {
+    try {
+      const made = await api('GET', `/v1/jobs/${id}/videos/${started}`, { signal });
+      if (VIDEO_ACTIVE.has(made.status)) running = made.id;
+    } catch {}
+  }
+  const more = running ? `It is ${running}: call video with video: "${running}" and wait: true to follow it.` : `Its card on ${config.origin}/app/requests shows how it goes.`;
+  return new Refusal(`${error.details.message} ${more} (${error.details.code})`, error.details);
+}
+
+async function video(args, context) {
+  const id = args.job;
+  if (!JOB_ID.test(id ?? '')) throw new Refusal('`job` is a job id like rq_0123456789abcdef.');
+  let made;
+  if (args.video !== undefined) {
+    if (typeof args.video !== 'string' || !VIDEO_ID.test(args.video)) throw new Refusal('`video` is an MP4 id like vid_0123456789abcdef, as an earlier call of video answered it.');
+    if (VIDEO_FIELDS.some((name) => args[name] !== undefined)) throw new Refusal('Give `video` to follow an MP4 already started, or `frames`, `leave_out` and `fps` to make a new one: not both.');
+    made = await api('GET', `/v1/jobs/${id}/videos/${args.video}`, { signal: context.signal });
+  } else {
+    const body = Object.fromEntries(VIDEO_FIELDS.filter((name) => args[name] !== undefined).map((name) => [name, args[name]]));
+    try {
+      // Not tried again when the network fails: a second start would be refused as running, with no id.
+      made = await api('POST', `/v1/jobs/${id}/videos`, { body, signal: context.signal });
+    } catch (error) {
+      throw error instanceof Refusal && error.details?.code === 'video_running' ? await videoRunning(error, id, context.signal) : error;
+    }
+    videosStarted.set(id, made.id);
+  }
+  if (args.wait === true) {
+    const until = Date.now() + config.waitMs;
+    while (VIDEO_ACTIVE.has(made.status) && Date.now() < until) {
+      context.progress(made.frames.done, made.frames.total || undefined, `${made.phase ?? made.status}: ${made.frames.done} of ${made.frames.total} frames`);
+      await sleep(config.pollMs, context.signal);
+      made = await api('GET', `/v1/jobs/${id}/videos/${made.id}`, { signal: context.signal });
+    }
+  }
+  if (made.status !== 'done') return result(sayVideo(made, { waited: args.wait === true }), made);
+  const again = `call video with video: "${made.id}" to save it again`;
+  if (!made.url) return result(`${made.id} (an MP4 of ${made.job}) is ready, but CloudBake answered no link to it: ${again} in a moment.`, made);
+
+  const into = pathOf(args.folder || join('renders', id));
+  await mkdir(into, { recursive: true });
+  const to = join(into, `${made.id}.mp4`);
+  context.progress(made.frames.done, made.frames.total || undefined, `Downloading ${made.id}.mp4`);
+  const bytes = await saveFile(made.url, to, context.signal, again);
+  if (typeof made.bytes === 'number' && bytes !== made.bytes) {
+    await rm(to, { force: true });
+    throw new Refusal(`${made.id}.mp4 arrived with ${bytes} of its ${made.bytes} bytes, so it was not kept: ${again}.`);
+  }
+  return result(sayVideo(made, { saved: to }), { ...made, file: to });
+}
+
 async function whoami(_args, context) {
   const me = await api('GET', '/v1/me', { signal: context.signal });
   const now = accountSentence(me);
@@ -435,7 +559,7 @@ async function whoami(_args, context) {
 
 const INSTRUCTIONS = [
   'CloudBake renders Blender scenes on cloud GPUs and converts them to .glb, .fbx or .usdz.',
-  'A render: render (file and frames) answers at once with a job id; status with wait: true follows it until it ends; download saves the frames into the project.',
+  'A render: render (file and frames) answers at once with a job id; status with wait: true follows it until it ends; download saves the frames into the project, and video (wait: true) makes an MP4 of them, free.',
   "GPU time is charged to the person's CloudBake credit: before rendering more than a few frames, render one test frame, show it, and say how many frames the full job is and what it would cost (status gives the test frame's cost and seconds).",
   `An account runs ${AT_ONCE} jobs at once; whoami gives the exact limits, the balance and the jobs running now. Render many frames as one job (up to ${FRAMES_A_JOB} frames), not as many jobs: a job beyond the limit is refused, not queued.`,
 ].join(' ');
