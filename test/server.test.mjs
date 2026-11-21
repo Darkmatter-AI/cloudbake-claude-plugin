@@ -451,14 +451,20 @@ test('video: following one already started, and a second start points at it', as
   assert.equal(started.text.split('\n\n')[0], `${made.id} (an MP4 of ${job.id}) is starting: 0 of 8 frames. Call video with video: "${made.id}" and wait: true to follow it.`);
   assert.deepEqual(fake.state.calls.findLast((call) => call.method === 'POST' && call.path.endsWith('/videos')).body, { fps: 12 });
 
+  const pointed = `An MP4 of this render is being made. Make the next one when it is ready. It is ${made.id}: call video with video: "${made.id}" and wait: true to follow it. (video_running)`;
   const again = await mcp.tool('video', { job: job.id });
   assert.equal(again.isError, true);
-  assert.equal(again.text, `An MP4 of this render is being made. Make the next one when it is ready. It is ${made.id}: call video with video: "${made.id}" and wait: true to follow it. (video_running)`);
+  assert.equal(again.text, pointed);
+  assert.equal(again.structuredContent.error.video, made.id);
 
-  // Another server (a new session) did not start it: it points at the card instead.
+  // The API names the one being made, so a server that did not start it (a new session) points at it too.
   const other = connect();
-  const elsewhere = await other.tool('video', { job: job.id });
-  assert.match(elsewhere.text, /being made\. .*Its card on http:\/\/127\.0\.0\.1:\d+\/app\/requests shows how it goes\. \(video_running\)$/);
+  assert.equal((await other.tool('video', { job: job.id })).text, pointed);
+  // An answer without the name (the API before it gave one): the job's card instead.
+  fake.state.oldVideoRunning = true;
+  const old = await other.tool('video', { job: job.id });
+  fake.state.oldVideoRunning = false;
+  assert.match(old.text, /being made\. .*Its card on http:\/\/127\.0\.0\.1:\d+\/app\/requests shows how it goes\. \(video_running\)$/);
   await other.close();
 
   // A wait shorter than the export: it says to call again.

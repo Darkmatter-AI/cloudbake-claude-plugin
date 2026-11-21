@@ -59,8 +59,9 @@ const ENDED = ['done', 'failed', 'cancelled'];
 
 // `oldMe`: GET /v1/me as the API answered before it said the balance, the jobs running and the limits.
 // `rateLimitOnce`: the next POST /v1/jobs answers 429 rate_limited, once.
+// `oldVideoRunning`: a second MP4 of a job is refused as the API did before it named the one being made.
 export async function startFakeApi({ steps = 1, jobsAtOnce = 3 } = {}) {
-  const state = { uploads: new Map(), jobs: new Map(), puts: [], calls: [], idempotency: new Map(), outOfCredit: false, oldMe: false, rateLimitOnce: false, balanceCents: 500, videos: new Map(), holdVideos: false };
+  const state = { uploads: new Map(), jobs: new Map(), puts: [], calls: [], idempotency: new Map(), outOfCredit: false, oldMe: false, rateLimitOnce: false, balanceCents: 500, videos: new Map(), holdVideos: false, oldVideoRunning: false };
   let origin = '';
   const running = () => [...state.jobs.values()].filter((job) => !ENDED.includes(job.status)).map((job) => job.id);
   const usageOf = (job) => {
@@ -278,7 +279,8 @@ export async function startFakeApi({ steps = 1, jobsAtOnce = 3 } = {}) {
         const fps = body.fps === undefined ? 24 : Number(body.fps);
         if (!(fps >= 1 && fps <= 120)) return error(400, 'bad_fps', 'The frame rate is a number from 1 to 120, like 24 or 23.976.', { field: 'fps' });
         const running = [...state.videos.values()].filter((video) => VIDEO_ACTIVE.includes(video.status));
-        if (running.some((video) => video.job === job.id)) return error(409, 'video_running', 'An MP4 of this render is being made. Make the next one when it is ready.');
+        const same = running.find((video) => video.job === job.id);
+        if (same) return error(409, 'video_running', 'An MP4 of this render is being made. Make the next one when it is ready.', state.oldVideoRunning ? {} : { video: same.id });
         if (running.length >= 3) return error(429, 'videos_at_once', '3 MP4s are being made for your account. Make this one when one of them is ready.');
         const video = { id: `vid_${hex(8)}`, job: job.id, status: 'queued', phase: null, frames: [...new Set(frames)].sort((a, b) => a - b), done: 0, fps, width: null, height: null, bytes: null };
         state.videos.set(video.id, video);

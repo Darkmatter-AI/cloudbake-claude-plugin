@@ -25,7 +25,7 @@ import { createInterface } from 'node:readline';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 // MCP versions this server speaks, newest first. Nothing it uses changed between them.
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 const MAX_FILE = 4 * 1024 ** 3; // the API's limit: 4 GiB
@@ -488,20 +488,11 @@ async function cancel({ job: id }, context) {
 
 const VIDEO_FIELDS = ['frames', 'leave_out', 'fps'];
 const VIDEO_ACTIVE = new Set(['queued', 'encoding']);
-// job id → the MP4 of it this server started last. The API's refusal of a second start does not name the one
-// being made, so this is how the refusal points at it.
-const videosStarted = new Map();
 
-// The refusal of a second MP4 of a job, pointing at the one being made when this server started it.
-async function videoRunning(error, id, signal) {
-  const started = videosStarted.get(id);
-  let running = null;
-  if (started) {
-    try {
-      const made = await api('GET', `/v1/jobs/${id}/videos/${started}`, { signal });
-      if (VIDEO_ACTIVE.has(made.status)) running = made.id;
-    } catch {}
-  }
+// The refusal of a second MP4 of a job points at the one being made: the API names it (`video`). An answer
+// without it (an older API) points at the job's card instead.
+function videoRunning(error) {
+  const running = typeof error.details.video === 'string' && VIDEO_ID.test(error.details.video) ? error.details.video : null;
   const more = running ? `It is ${running}: call video with video: "${running}" and wait: true to follow it.` : `Its card on ${config.origin}/app/requests shows how it goes.`;
   return new Refusal(`${error.details.message} ${more} (${error.details.code})`, error.details);
 }
@@ -517,12 +508,11 @@ async function video(args, context) {
   } else {
     const body = Object.fromEntries(VIDEO_FIELDS.filter((name) => args[name] !== undefined).map((name) => [name, args[name]]));
     try {
-      // Not tried again when the network fails: a second start would be refused as running, with no id.
+      // Not tried again when the network fails: a second start would only be refused as running.
       made = await api('POST', `/v1/jobs/${id}/videos`, { body, signal: context.signal });
     } catch (error) {
-      throw error instanceof Refusal && error.details?.code === 'video_running' ? await videoRunning(error, id, context.signal) : error;
+      throw error instanceof Refusal && error.details?.code === 'video_running' ? videoRunning(error) : error;
     }
-    videosStarted.set(id, made.id);
   }
   if (args.wait === true) {
     const until = Date.now() + config.waitMs;
