@@ -146,6 +146,18 @@ mkdir -p ~/.config/cloudbake && pbpaste > ~/.config/cloudbake/api_key && chmod 6
 On Linux, run `cat > ~/.config/cloudbake/api_key`, paste, then press Ctrl-D. `grok mcp doctor cloudbake` checks that
 the server starts. Then ask Grok: **"Render frame 1 of scene.blend with CloudBake."**
 
+**If Claude Code also has CloudBake as a server** (added with `claude mcp add … cloudbake https://cloudbake.ai/mcp`),
+Grok imports that entry from `~/.claude.json`, and it outranks the plugin's server of the same name. The session
+then has no CloudBake tools ("auth required"), although `grok mcp doctor` shows the plugin's server as healthy.
+Tell Grok not to import Claude Code's MCP servers, in `~/.grok/config.toml`:
+
+```toml
+[compat.claude]
+mcps = false
+```
+
+(or start Grok with `GROK_CLAUDE_MCPS_ENABLED=false`). Claude Code keeps its own server.
+
 Without the plugin, Grok Build can also use the hosted server, with a key:
 `grok mcp add --transport http cloudbake https://cloudbake.ai/mcp --header 'Authorization: Bearer ${CLOUDBAKE_API_KEY}'`
 (in single quotes: Grok fills in the variable each time it starts, so the key is not written in its config).
