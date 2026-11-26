@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// CloudBake's MCP server for Claude Code. It renders a .blend from this computer on CloudBake's
-// cloud GPUs and saves what the job made back into the project folder, and makes an MP4 of a render's frames.
+// CloudBake's MCP server for Claude Code, Codex and Grok Build. It renders a .blend from this computer on
+// CloudBake's cloud GPUs and saves what the job made back into the project folder, and makes an MP4 of a render's frames.
 //
 // It speaks MCP over stdio (one JSON-RPC 2.0 message a line) and calls the public API, the same one
 // https://cloudbake.ai/docs/api describes, with the user's API key. A file goes from the disk straight to
@@ -11,21 +11,27 @@
 // Settings, from the environment:
 //   CLOUDBAKE_PLUGIN_KEY   the key the plugin asked for at install (.mcp.json passes ${user_config.api_key})
 //   CLOUDBAKE_API_KEY      used when the plugin has none: the quickstart's variable
-//   CLOUDBAKE_PROJECT_DIR  what relative paths are relative to (.mcp.json passes ${CLAUDE_PROJECT_DIR})
+//   ~/.config/cloudbake/api_key   used when neither is set ($XDG_CONFIG_HOME/cloudbake/api_key when that is set):
+//                          for Codex and Grok, which cannot ask for a key at install. Read again on every call.
+//   CLOUDBAKE_PROJECT_DIR  what relative paths are relative to (.mcp.json passes ${CLAUDE_PROJECT_DIR}). Codex
+//                          starts the server in the plugin's folder and names the project on every call instead
+//                          (_meta["x-codex-turn-metadata"].workspaces), which is used when this is not set.
 //   CLOUDBAKE_URL          the API's address, https://cloudbake.ai unless set (for tests)
 //   CLOUDBAKE_POLL_MS, CLOUDBAKE_WAIT_SECONDS   how often, and how long at most, `status` and `video` ask while they wait
 
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, open, rename, rm, stat } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { randomUUID } from 'node:crypto';
-import { basename, extname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
-const VERSION = '0.3.1';
+const VERSION = '0.4.0';
 // MCP versions this server speaks, newest first. Nothing it uses changed between them.
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 const MAX_FILE = 4 * 1024 ** 3; // the API's limit: 4 GiB
@@ -47,8 +53,9 @@ function setting(name) {
 
 const config = {
   key: setting('CLOUDBAKE_PLUGIN_KEY') || setting('CLOUDBAKE_API_KEY'),
+  keyFile: join(setting('XDG_CONFIG_HOME') || join(homedir(), '.config'), 'cloudbake', 'api_key'),
   origin: (setting('CLOUDBAKE_URL') || 'https://cloudbake.ai').replace(/\/+$/, ''),
-  projectDir: setting('CLOUDBAKE_PROJECT_DIR') || process.cwd(),
+  projectDir: setting('CLOUDBAKE_PROJECT_DIR'),
   pollMs: Number(setting('CLOUDBAKE_POLL_MS')) || 4000,
   waitMs: (Number(setting('CLOUDBAKE_WAIT_SECONDS')) || 300) * 1000,
 };
@@ -69,7 +76,44 @@ const sleep = (ms, signal) =>
     signal?.addEventListener('abort', () => (clearTimeout(timer), fail(signal.reason)), { once: true });
   });
 
-const pathOf = (path) => resolve(isAbsolute(path) ? path : join(config.projectDir, path));
+// The app that started the server, from initialize's clientInfo: what to say about setting a key differs.
+const client = { name: '' };
+const host = () => (/codex/i.test(client.name) ? 'codex' : /grok/i.test(client.name) ? 'grok' : 'claude');
+const HOW_TO_SET_KEY = {
+  claude: 'give it to the plugin with /plugin configure cloudbake@cloudbake in Claude Code, and restart Claude Code (or set CLOUDBAKE_API_KEY in the shell that starts it)',
+  codex: 'save it in ~/.config/cloudbake/api_key (copy the key, then run: mkdir -p ~/.config/cloudbake && pbpaste > ~/.config/cloudbake/api_key && chmod 600 ~/.config/cloudbake/api_key), or set CLOUDBAKE_API_KEY in the shell that starts Codex',
+  grok: 'save it in ~/.config/cloudbake/api_key (copy the key, then run: mkdir -p ~/.config/cloudbake && pbpaste > ~/.config/cloudbake/api_key && chmod 600 ~/.config/cloudbake/api_key), or set CLOUDBAKE_API_KEY in the shell that starts Grok',
+};
+
+// The key: the plugin's, the shell's, else the key file, read on each call so a key saved there works at once.
+async function apiKey() {
+  if (config.key) return config.key;
+  try {
+    return (await readFile(config.keyFile, 'utf8')).trim();
+  } catch {
+    return '';
+  }
+}
+
+// The folder relative paths are relative to: the one the app passed at start, else the project Codex names on
+// this call, else where the server was started, unless that is the plugin's own folder (as Codex starts it).
+const PLUGIN_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const inside = (folder, root) => !relative(root, folder).startsWith('..') && !isAbsolute(relative(root, folder));
+function projectOf(meta) {
+  if (config.projectDir) return config.projectDir;
+  const workspaces = meta?.['x-codex-turn-metadata']?.workspaces;
+  const named = workspaces && typeof workspaces === 'object' ? Object.keys(workspaces).find((folder) => isAbsolute(folder)) : undefined;
+  if (named) return named;
+  const here = process.cwd();
+  return inside(here, PLUGIN_ROOT) ? '' : here;
+}
+
+function pathOf(path, context) {
+  if (isAbsolute(path)) return resolve(path);
+  const project = context?.project;
+  if (!project) throw new Refusal(`${path} is relative, and this app did not say which folder the project is in. Give the full path, starting with /.`);
+  return resolve(join(project, path));
+}
 
 // ---------------------------------------------------------------------------------------------------------
 // The API
@@ -79,15 +123,14 @@ const pathOf = (path) => resolve(isAbsolute(path) ? path : join(config.projectDi
 // those can start a second job. too_many_jobs is a 429 too, but it is not a rate limit: a job ends in
 // minutes, not seconds, so it is said at once, with the jobs to wait on.
 async function api(method, path, { body, idempotencyKey, retry = false, signal, withStatus = false } = {}) {
-  if (!config.key) {
-    throw new Refusal(
-      `No CloudBake API key is set. Make one at ${CONNECTIONS}, then give it to the plugin with /plugin configure cloudbake@cloudbake in Claude Code, and restart Claude Code (or set CLOUDBAKE_API_KEY in the shell that starts it). Never paste the key into the chat.`,
-    );
+  const key = await apiKey();
+  if (!key) {
+    throw new Refusal(`No CloudBake API key is set. Make one at ${CONNECTIONS}, then ${HOW_TO_SET_KEY[host()]}. Never paste the key into the chat.`);
   }
-  if (!KEY.test(config.key)) {
+  if (!KEY.test(key)) {
     throw new Refusal(`The CloudBake API key set for the plugin does not look like one (cb_live_ and 40 hex digits). Make a new one at ${CONNECTIONS} and set it again.`);
   }
-  const headers = { authorization: `Bearer ${config.key}`, accept: 'application/json', 'user-agent': `cloudbake-claude-plugin/${VERSION}` };
+  const headers = { authorization: `Bearer ${key}`, accept: 'application/json', 'user-agent': `cloudbake-${host()}-plugin/${VERSION}` };
   if (body !== undefined) headers['content-type'] = 'application/json';
   if (idempotencyKey) headers['idempotency-key'] = idempotencyKey;
   const again = method === 'GET' || Boolean(idempotencyKey) || retry;
@@ -138,8 +181,8 @@ async function looksLikeBlend(path) {
   }
 }
 
-async function checkBlend(path) {
-  const full = pathOf(path);
+async function checkBlend(path, context) {
+  const full = pathOf(path, context);
   let info;
   try {
     info = await stat(full);
@@ -184,7 +227,7 @@ function putFile(url, path, bytes, { signal, progress }) {
 }
 
 async function upload(path, context) {
-  const { full, bytes } = await checkBlend(path);
+  const { full, bytes } = await checkBlend(path, context);
   const made = await api('POST', '/v1/uploads', { body: { name: basename(full).slice(0, 200), bytes }, signal: context.signal });
   await putFile(made.upload_url, full, bytes, context);
   return made.id;
@@ -465,7 +508,7 @@ async function download({ job: id, folder, zip = false }, context) {
   let files = answer.files;
   if (answer.job.kind === 'render') files = files.filter((file) => (file.name === 'frames.zip') === zip);
   if (files.length === 0) return result(`${id} ended (${answer.job.status}) with no files to save.`);
-  const into = pathOf(folder || join('renders', id));
+  const into = pathOf(folder || join('renders', id), context);
   await mkdir(into, { recursive: true });
   const saved = [];
   for (const [index, file] of files.entries()) {
@@ -526,7 +569,7 @@ async function video(args, context) {
   const again = `call video with video: "${made.id}" to save it again`;
   if (!made.url) return result(`${made.id} (an MP4 of ${made.job}) is ready, but CloudBake answered no link to it: ${again} in a moment.`, made);
 
-  const into = pathOf(args.folder || join('renders', id));
+  const into = pathOf(args.folder || join('renders', id), context);
   await mkdir(into, { recursive: true });
   const to = join(into, `${made.id}.mp4`);
   context.progress(made.frames.done, made.frames.total || undefined, `Downloading ${made.id}.mp4`);
@@ -565,6 +608,7 @@ async function call(params, id) {
   const token = params._meta?.progressToken;
   const context = {
     signal: controller.signal,
+    project: projectOf(params._meta),
     progress: (progress, total, message) => {
       if (token !== undefined) write({ jsonrpc: '2.0', method: 'notifications/progress', params: { progressToken: token, progress, ...(total ? { total } : {}), message } });
     },
@@ -590,6 +634,7 @@ async function handle(message) {
   let answer;
   if (method === 'initialize') {
     const asked = params?.protocolVersion;
+    client.name = String(params?.clientInfo?.name ?? '');
     answer = {
       result: {
         protocolVersion: PROTOCOLS.includes(asked) ? asked : PROTOCOLS[0],

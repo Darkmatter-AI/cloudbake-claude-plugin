@@ -1,0 +1,20 @@
+{
+  "name": "cloudbake",
+  "interface": {
+    "displayName": "CloudBake"
+  },
+  "plugins": [
+    {
+      "name": "cloudbake",
+      "source": {
+        "source": "local",
+        "path": "./codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Design"
+    }
+  ]
+}
