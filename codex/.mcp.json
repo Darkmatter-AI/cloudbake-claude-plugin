@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "cloudbake": {
+      "type": "http",
+      "url": "https://cloudbake.ai/mcp",
+      "tool_timeout_sec": 180
+    }
+  }
+}

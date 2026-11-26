@@ -1,0 +1,22 @@
+{
+  "name": "cloudbake",
+  "version": "0.4.0",
+  "author": {
+    "name": "CloudBake",
+    "email": "hello@cloudbake.ai",
+    "url": "https://cloudbake.ai"
+  },
+  "homepage": "https://cloudbake.ai/docs/quickstart",
+  "repository": "https://github.com/Darkmatter-AI/cloudbake-claude-plugin",
+  "license": "MIT",
+  "keywords": [
+    "blender",
+    "render",
+    "gpu",
+    "cycles",
+    "3d",
+    "glb",
+    "usdz"
+  ],
+  "description": "Render Blender scenes on cloud GPUs with CloudBake from Grok Build: send a .blend from your project, and the frames come back into it. Converts to .glb, .fbx and .usdz too."
+}

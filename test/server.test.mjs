@@ -14,12 +14,14 @@ const BLEND = Buffer.concat([Buffer.from('BLENDER-v405REND'), Buffer.alloc(4096,
 
 let fake;
 let project;
+let noConfig; // an empty config folder, so a key saved on this computer is never read by the tests
 
 before(async () => {
   // The tests share this fake and leave jobs running, so its jobs-at-once limit is out of the way; the tests
   // of the limit start a fake of their own (limitedApi).
   fake = await startFakeApi({ jobsAtOnce: 1000 });
   project = await mkdtemp(join(tmpdir(), 'cloudbake-plugin-'));
+  noConfig = await mkdtemp(join(tmpdir(), 'cloudbake-config-'));
   await writeFile(join(project, 'scene.blend'), BLEND);
   await writeFile(join(project, 'broken.blend'), BLEND);
   await writeFile(join(project, 'flaky.blend'), BLEND);
@@ -30,12 +32,14 @@ after(async () => {
   for (const child of children) child.kill();
   await fake.close();
   await rm(project, { recursive: true, force: true });
+  await rm(noConfig, { recursive: true, force: true });
 });
 
 // Start the server with these settings; talk to it as an MCP client.
-function connect(env = {}) {
+function connect(env = {}, { cwd } = {}) {
   const child = spawn(process.execPath, [SERVER], {
-    env: { PATH: process.env.PATH, CLOUDBAKE_URL: fake.origin, CLOUDBAKE_PROJECT_DIR: project, CLOUDBAKE_POLL_MS: '5', CLOUDBAKE_WAIT_SECONDS: '5', CLOUDBAKE_API_KEY: FAKE_KEY, ...env },
+    env: { PATH: process.env.PATH, XDG_CONFIG_HOME: noConfig, CLOUDBAKE_URL: fake.origin, CLOUDBAKE_PROJECT_DIR: project, CLOUDBAKE_POLL_MS: '5', CLOUDBAKE_WAIT_SECONDS: '5', CLOUDBAKE_API_KEY: FAKE_KEY, ...env },
+    ...(cwd ? { cwd } : {}),
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   children.add(child);
@@ -489,5 +493,57 @@ test('video: following one already started, and a second start points at it', as
   const unknown = await mcp2.tool('video', { job: job.id, video: 'vid_0123456789abcdef' });
   assert.match(unknown.text, /This job has no MP4 with this id.*\(video_not_found\)/);
   await mcp2.close();
+  await mcp.close();
+});
+
+// Codex starts a plugin's server in the plugin's own folder, passes no project folder and cannot ask for a key
+// at install: it names the project on every call, and the key can be in ~/.config/cloudbake/api_key.
+const PLUGIN_ROOT = new URL('..', import.meta.url).pathname;
+const codexMeta = (folder) => ({ 'x-codex-turn-metadata': { workspaces: { [folder]: { has_changes: false } } }, plugin_id: 'cloudbake@cloudbake' });
+
+test('Codex: relative paths are in the project the call names, and refused when no call names one', async () => {
+  const mcp = connect({ CLOUDBAKE_PROJECT_DIR: '' }, { cwd: PLUGIN_ROOT });
+  await mcp.ask('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'codex-mcp-client', version: '0.172.0' } });
+
+  const lost = await mcp.tool('render', { file: 'scene.blend', frames: '1' });
+  assert.equal(lost.isError, true);
+  assert.match(lost.text, /scene\.blend is relative.*Give the full path/);
+
+  const started = await mcp.tool('render', { file: 'scene.blend', frames: '1' }, codexMeta(project));
+  assert.ok(!started.isError, started.text);
+  const job = jobOf(started.text).job ?? jobOf(started.text);
+  const id = job.id;
+  await mcp.tool('status', { job: id, wait: true }, codexMeta(project));
+  const saved = await mcp.tool('download', { job: id }, codexMeta(project));
+  assert.ok(!saved.isError, saved.text);
+  assert.ok((await readdir(join(project, 'renders', id))).some((name) => name.endsWith('.png')));
+  await mcp.close();
+});
+
+test('Codex and Grok: the key can be in ~/.config/cloudbake/api_key, read on each call, and is never printed', async () => {
+  const config = await mkdtemp(join(tmpdir(), 'cloudbake-config-'));
+  const mcp = connect({ CLOUDBAKE_API_KEY: '', XDG_CONFIG_HOME: config });
+  await mcp.ask('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'codex-mcp-client', version: '0.172.0' } });
+  const none = await mcp.tool('whoami');
+  assert.equal(none.isError, true);
+  assert.match(none.text, /No CloudBake API key is set/);
+  assert.match(none.text, /~\/\.config\/cloudbake\/api_key/);
+  assert.doesNotMatch(none.text, /\/plugin configure/);
+
+  const { mkdir } = await import('node:fs/promises');
+  await mkdir(join(config, 'cloudbake'), { recursive: true });
+  await writeFile(join(config, 'cloudbake', 'api_key'), `${FAKE_KEY}\n`);
+  const me = await mcp.tool('whoami');
+  assert.ok(!me.isError, me.text);
+  assert.doesNotMatch(mcp.output(), new RegExp(FAKE_KEY));
+  await mcp.close();
+  await rm(config, { recursive: true, force: true });
+});
+
+test('Grok Build: the missing-key sentence says how to set it there', async () => {
+  const mcp = connect({ CLOUDBAKE_API_KEY: '' });
+  await mcp.ask('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'grok', version: '1.0.70' } });
+  const none = await mcp.tool('whoami');
+  assert.match(none.text, /starts Grok/);
   await mcp.close();
 });

@@ -1,6 +1,6 @@
 {
   "name": "cloudbake",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Render Blender scenes on cloud GPUs with CloudBake from Claude Code: send a .blend from your project, and the frames come back into it. Converts to .glb, .fbx and .usdz too.",
   "author": {
     "name": "CloudBake",

@@ -1,0 +1,45 @@
+{
+  "name": "cloudbake",
+  "version": "0.4.0",
+  "description": "Render Blender scenes on cloud GPUs with CloudBake from Codex: send a .blend from your project, and the frames come back into it. Converts to .glb, .fbx and .usdz too.",
+  "author": {
+    "name": "CloudBake",
+    "email": "hello@cloudbake.ai",
+    "url": "https://cloudbake.ai"
+  },
+  "homepage": "https://cloudbake.ai/docs/connect",
+  "repository": "https://github.com/Darkmatter-AI/cloudbake-claude-plugin",
+  "license": "MIT",
+  "keywords": [
+    "blender",
+    "render",
+    "gpu",
+    "cycles",
+    "3d",
+    "glb",
+    "usdz"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "CloudBake",
+    "shortDescription": "Render Blender scenes on cloud GPUs",
+    "longDescription": "Ask Codex to render frames of a .blend in your project. The file goes to CloudBake, a cloud GPU renders it, and the frames are saved back into the project. It also makes an MP4 of a render and converts scenes to .glb, .fbx and .usdz. GPU time is paid from your CloudBake credit; Codex renders one test frame first and says what the whole job would cost.",
+    "developerName": "CloudBake",
+    "category": "Design",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://cloudbake.ai",
+    "privacyPolicyURL": "https://cloudbake.ai/privacy",
+    "brandColor": "#111113",
+    "composerIcon": "./assets/icon.png",
+    "logo": "./assets/icon.png",
+    "defaultPrompt": [
+      "Render frame 1 of the CloudBake sample scene and show it to me.",
+      "Render frames 1-24 of scene.blend with CloudBake into renders/.",
+      "Make an MP4 of my last CloudBake render."
+    ]
+  }
+}
