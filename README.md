@@ -185,7 +185,9 @@ The tool it sends is:
 ```
 
 xAI's servers call CloudBake, so the scene must be online: the sample, an upload made earlier (`upload: "up_…"`),
-or a link to a .blend (`url`). The frames come back as links.
+or a link to a .blend (`url`). The frames come back as links. A sample frame takes about a minute and a cent;
+the tokens are paid from your xAI credit. xAI stops a tool call after 60 seconds, and `status` with `wait` can
+wait up to 90, so the first wait may come back as a timeout: Grok calls `status` again, and the job is not affected.
 
 ## Update or remove
 
